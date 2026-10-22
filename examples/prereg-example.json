@@ -1,0 +1,40 @@
+{
+  "_note": "illustrative, not a preregistration",
+  "schema_version": 1,
+  "primary": [
+    {
+      "id": "h1_cue_sensitivity_en",
+      "table": "effects",
+      "metric": "gold_pct",
+      "contrast": "event_minus_neutral",
+      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "minimum_meaningful_effect": 2.0
+    },
+    {
+      "id": "h2_beyond_occasion_salience_en",
+      "table": "effects",
+      "metric": "gold_pct",
+      "contrast": "event_minus_occasion_control",
+      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "minimum_meaningful_effect": 2.0
+    },
+    {
+      "id": "h3_unsupported_return_claim_en",
+      "table": "effects",
+      "metric": "return_claim_deviation_pp",
+      "contrast": "event_minus_neutral",
+      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "minimum_meaningful_effect": 0.5
+    },
+    {
+      "id": "h4_language_amplification_hi",
+      "table": "language_interactions",
+      "metric": "gold_pct",
+      "contrast": "event_minus_neutral",
+      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "hi"},
+      "minimum_meaningful_effect": 2.0
+    }
+  ],
+  "primary_adjustment": "holm",
+  "exploratory_adjustment": "benjamini_hochberg"
+}

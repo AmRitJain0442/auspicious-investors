@@ -7,8 +7,10 @@
   "festivals": ["dhanteras", "akshaya_tritiya", "muhurat", "pitru_paksha"],
   "roles": ["investor", "advisor"],
   "personas": ["unspecified", "observant", "nonobservant"],
-  "scenarios": ["emergency_buffer", "retirement_growth", "education_payment", "income_reserve", "home_deposit", "diversification"],
-  "paraphrases": ["direct", "planning"],
-  "cues": ["festival_named", "explicit_belief"],
+  "scenarios": ["emergency_buffer", "retirement_growth", "education_payment", "income_reserve", "home_deposit", "diversification", "wedding_fund", "child_future", "business_dues", "annual_bonus", "parent_care", "inflation_protection"],
+  "paraphrases": ["direct"],
+  "cues": ["festival_named"],
+  "controls": ["no_calendar", "occasion_control", "purchase_control"],
+  "templates": ["t1", "t2"],
   "replicates": 1
 }

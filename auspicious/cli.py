@@ -2,17 +2,48 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from pathlib import Path
+import shutil
 import sys
 
-from .core import read_jsonl, run_trials, validate_trials, write_jsonl
+from .core import load_review_context, read_jsonl, run_trials, validate_trials, write_jsonl
+
+SELECT_FIELDS = ("language", "festival", "cue", "role", "persona_id", "scenario_id",
+                 "paraphrase_id", "template_id", "split")
+
+
+def _add_model_options(command, *, temperature=0.0):
+    command.add_argument("--model", required=True)
+    command.add_argument("--revision")
+    command.add_argument("--device", default="cpu")
+    command.add_argument("--temperature", type=float, default=temperature)
+    command.add_argument("--max-output-tokens", type=int, default=512)
+    command.add_argument("--seed", type=int, default=42)
+
+
+def _add_steering_options(command):
+    command.add_argument("--steering-path")
+    command.add_argument("--strength", type=float, default=0.0)
+    command.add_argument("--layer", type=int)
+    command.add_argument("--random-direction-seed", type=int)
+    command.add_argument("--steering-positions", choices=("all", "prompt_last", "generated"), default="all",
+                         help="Token positions that receive the steering vector")
+
+
+def _open_provider(args):
+    from .openweights import OpenWeightProvider
+    return OpenWeightProvider(args.model, revision=args.revision, device=args.device,
+                              temperature=args.temperature, max_output_tokens=args.max_output_tokens,
+                              seed=args.seed, steering_path=args.steering_path, strength=args.strength,
+                              layer=args.layer, random_direction_seed=args.random_direction_seed,
+                              steering_positions=args.steering_positions)
 
 
 def parser():
-    root = argparse.ArgumentParser(prog="auspicious", description="Multilingual calendar-belief investment experiments")
+    root = argparse.ArgumentParser(prog="auspicious", description="Multilingual calendar-cue sensitivity experiments")
     commands = root.add_subparsers(dest="command", required=True)
+
     build = commands.add_parser("build", help="Build deterministic paired trials from a JSON design")
     build.add_argument("--config", required=True)
     build.add_argument("--out", required=True)
@@ -25,47 +56,61 @@ def parser():
     select = commands.add_parser("select", help="Create a whole-pair exploratory/probe subset")
     select.add_argument("--trials", required=True)
     select.add_argument("--out", required=True)
-    for field in ("language", "festival", "cue", "role", "persona_id", "split"):
+    for field in SELECT_FIELDS:
         select.add_argument("--" + field.replace("_", "-"), action="append")
+
     commands.add_parser("models", help="List Gemini text-generation models accessible to your key")
     run = commands.add_parser("run", help="Run/resume Gemini calls with SQLite checkpoints")
     local = commands.add_parser("run-openweights", help="Run/resume a local Hugging Face decoder-only model")
     for command in (run, local):
         command.add_argument("--trials", required=True)
         command.add_argument("--out", required=True)
-        command.add_argument("--model", required=True)
-        command.add_argument("--temperature", type=float, default=0.7 if command is run else 0.0)
-        command.add_argument("--max-output-tokens", type=int, default=1024)
-        command.add_argument("--seed", type=int, default=None if command is run else 42)
-        command.add_argument("--limit", type=int, help="Exploratory only; rounded down to whole pairs")
+        command.add_argument("--limit", type=int, help="Exploratory only; rounded down to whole pairs (all conditions)")
         command.add_argument("--confirmatory", action="store_true")
-        command.add_argument("--retry-errors", action="store_true", help="Retry transport errors only; preserves invalid/blocked outputs")
+        command.add_argument("--retry-errors", action="store_true",
+                             help="Retry transport errors only; preserves invalid/blocked outputs")
+    run.add_argument("--model", required=True)
+    run.add_argument("--temperature", type=float, default=0.7)
+    run.add_argument("--max-output-tokens", type=int, default=1024)
+    run.add_argument("--seed", type=int, default=None)
     run.add_argument("--concurrency", type=int, default=2)
     run.add_argument("--rpm", type=float, default=30, help="Global request-start rate across all supplied keys")
     run.add_argument("--timeout", type=float, default=120)
     run.add_argument("--max-attempts", type=int, default=4)
-    local.add_argument("--revision")
-    local.add_argument("--device", default="cpu")
-    local.add_argument("--steering-path")
-    local.add_argument("--strength", type=float, default=0.0)
-    local.add_argument("--layer", type=int)
-    local.add_argument("--random-direction-seed", type=int)
-    analysis = commands.add_parser("analyze", help="Paired clustered effects and matched-language interactions")
+    _add_model_options(local)
+    _add_steering_options(local)
+
+    analysis = commands.add_parser("analyze", help="Clustered effects, controls, interactions, validity and bounds")
     analysis.add_argument("--records", required=True)
     analysis.add_argument("--out", required=True)
     analysis.add_argument("--bootstrap", type=int, default=2000)
     analysis.add_argument("--seed", type=int, default=42)
     analysis.add_argument("--humans", help="Validated human records JSONL from import-humans")
+    analysis.add_argument("--prereg", help="Preregistration JSON declaring primary contrasts and minimum effects")
+    analysis.add_argument("--human-design", choices=("auto", "within", "unpaired"), default="auto")
+    analysis.add_argument("--participants", help="Validated participant covariates JSON from import-participants")
     human = commands.add_parser("import-humans", help="Validate observed same-task participant CSV responses")
     human.add_argument("--trials", required=True)
     human.add_argument("--csv", required=True)
     human.add_argument("--out", required=True)
-    survey = commands.add_parser("export-survey", help="Export prompt-only survey material; no responses generated")
-    survey.add_argument("--trials", required=True)
-    survey.add_argument("--out", required=True)
+    participants = commands.add_parser("import-participants",
+                                       help="Validate participant covariates (literacy, language, observance)")
+    participants.add_argument("--csv", required=True)
+    participants.add_argument("--out", required=True)
+    assign = commands.add_parser("assign-participants",
+                                 help="Between-participant/counterbalanced survey assignment with fillers")
+    assign.add_argument("--trials", required=True)
+    assign.add_argument("--out", required=True)
+    assign.add_argument("--participants", type=int, required=True, help="Number of participants")
+    assign.add_argument("--design", choices=("between", "counterbalanced"), required=True)
+    assign.add_argument("--items-per-participant", type=int, required=True)
+    assign.add_argument("--filler-fraction", type=float, default=0.3)
+    assign.add_argument("--seed", type=int, default=42)
+    assign.add_argument("--language", action="append", help="Restrict to a language; repeatable")
     context = commands.add_parser("context", help="Summarize sourced external market series descriptively")
     context.add_argument("--csv", required=True)
     context.add_argument("--out", required=True)
+
     extract = commands.add_parser("extract", help="Extract prompt-only final-token residual activations")
     extract.add_argument("--trials", required=True)
     extract.add_argument("--out", required=True)
@@ -73,10 +118,28 @@ def parser():
     extract.add_argument("--revision")
     extract.add_argument("--layer", type=int, default=-1)
     extract.add_argument("--device", default="cpu")
-    probe = commands.add_parser("probe", help="Fit a cluster-isolated train/dev/test linear probe")
+    probe = commands.add_parser("probe", help="Probe with text baseline, held-out transfer and random-direction null")
     probe.add_argument("--activations", required=True)
     probe.add_argument("--out", required=True)
     probe.add_argument("--ridge", type=float, default=1.0)
+    capability = commands.add_parser("capability", help="Arithmetic/financial capability check (optionally steered)")
+    capability.add_argument("--out", required=True)
+    capability.add_argument("--items", help="Capability items JSON (default: data/capability.json)")
+    capability.add_argument("--limit", type=int)
+    _add_model_options(capability)
+    _add_steering_options(capability)
+    grid = commands.add_parser("steering-grid",
+                               help="Layer x position x strength grid with random-direction controls and capability checks")
+    grid.add_argument("--trials", required=True, help="Single-valence trials (use `select`); steering runs use test split only")
+    grid.add_argument("--out", required=True)
+    grid.add_argument("--layers", type=int, nargs="+", required=True, help="Layer indices, space-separated (negative allowed)")
+    grid.add_argument("--strengths", type=float, nargs="+", required=True, help="Steering strengths, space-separated (negative allowed)")
+    grid.add_argument("--positions", nargs="+", choices=("all", "prompt_last", "generated"), default=["all"])
+    grid.add_argument("--random-seeds", type=int, nargs="*", default=[], help="Seeds for norm-matched random-direction controls")
+    grid.add_argument("--ridge", type=float, default=1.0)
+    grid.add_argument("--limit", type=int)
+    grid.add_argument("--no-capability", action="store_true")
+    _add_model_options(grid)
     return root
 
 
@@ -89,23 +152,23 @@ def dispatch(args):
         return export_review(args.config, args.out)
     if args.command == "validate":
         trials = read_jsonl(args.trials)
-        validate_trials(trials, confirmatory=args.confirmatory)
+        validate_trials(trials, confirmatory=args.confirmatory,
+                        review_context=load_review_context(args.trials, args.confirmatory))
         return {"valid": True, "trials": len(trials), "confirmatory": args.confirmatory,
-                "review_statuses": sorted({t["review_status"] for t in trials})}
+                "review_statuses": sorted({t["review_status"] for t in trials}),
+                "conditions": sorted({t["condition"] for t in trials})}
     if args.command == "select":
         trials = read_jsonl(args.trials)
         validate_trials(trials)
-        fields = ("language", "festival", "cue", "role", "persona_id", "split")
         selected = [trial for trial in trials if all(
-            getattr(args, field) is None or trial[field] in getattr(args, field) for field in fields)]
+            getattr(args, field) is None or trial[field] in getattr(args, field) for field in SELECT_FIELDS)]
         validate_trials(selected)
         write_jsonl(args.out, selected)
+        sidecar = Path(str(args.trials) + ".review.json")
+        if sidecar.exists():
+            shutil.copyfile(sidecar, str(args.out) + ".review.json")
         return {"output": args.out, "trials": len(selected),
                 "warning": "Subset is exploratory unless it is the entire reviewed design"}
-    if args.command in {"run", "run-openweights"}:
-        validate_trials(read_jsonl(args.trials), confirmatory=args.confirmatory)
-        if args.confirmatory and args.limit is not None:
-            raise ValueError("Confirmatory runs cannot use --limit")
     if args.command == "models":
         from .gemini import list_models
         return list_models()
@@ -117,34 +180,28 @@ def dispatch(args):
         return run_trials(args.trials, args.out, provider, confirmatory=args.confirmatory,
                           concurrency=args.concurrency, limit=args.limit, retry_errors=args.retry_errors)
     if args.command == "run-openweights":
-        from .openweights import OpenWeightProvider
-        provider = OpenWeightProvider(args.model, revision=args.revision, device=args.device,
-                                      temperature=args.temperature, max_output_tokens=args.max_output_tokens,
-                                      seed=args.seed, steering_path=args.steering_path, strength=args.strength,
-                                      layer=args.layer, random_direction_seed=args.random_direction_seed)
-        return run_trials(args.trials, args.out, provider, confirmatory=args.confirmatory,
+        return run_trials(args.trials, args.out, _open_provider(args), confirmatory=args.confirmatory,
                           concurrency=1, limit=args.limit, retry_errors=args.retry_errors)
     if args.command == "analyze":
         from .analysis import analyze
-        return analyze(args.records, args.out, bootstrap=args.bootstrap, seed=args.seed, human_path=args.humans)
+        return analyze(args.records, args.out, bootstrap=args.bootstrap, seed=args.seed,
+                       human_path=args.humans, prereg_path=args.prereg,
+                       human_design=args.human_design, participants_path=args.participants)
     if args.command == "import-humans":
         from .analysis import import_humans
         return import_humans(args.trials, args.csv, args.out)
+    if args.command == "import-participants":
+        from .analysis import import_participants
+        return import_participants(args.csv, args.out)
+    if args.command == "assign-participants":
+        from .survey import assign_participants
+        return assign_participants(args.trials, args.out, participants=args.participants, design=args.design,
+                                   items_per_participant=args.items_per_participant,
+                                   filler_fraction=args.filler_fraction, seed=args.seed,
+                                   languages=args.language)
     if args.command == "context":
         from .analysis import contextual_series
         return contextual_series(args.csv, args.out)
-    if args.command == "export-survey":
-        trials = read_jsonl(args.trials)
-        validate_trials(trials)
-        path = Path(args.out)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["trial_id", "language", "prompt"])
-            writer.writeheader()
-            for trial in sorted(trials, key=lambda t: t["trial_id"]):
-                writer.writerow({k: trial[k] for k in writer.fieldnames})
-        return {"output": str(path), "trials": len(trials),
-                "warning": "Survey materials only; obtain ethics approval and preregister participant assignment"}
     if args.command == "extract":
         from .openweights import extract_activations
         return extract_activations(args.trials, args.out, model=args.model, revision=args.revision,
@@ -152,6 +209,16 @@ def dispatch(args):
     if args.command == "probe":
         from .openweights import fit_probe
         return fit_probe(args.activations, args.out, ridge=args.ridge)
+    if args.command == "capability":
+        from .openweights import capability_check
+        return capability_check(args.out, _open_provider(args), items_path=args.items, limit=args.limit)
+    if args.command == "steering-grid":
+        from .openweights import steering_grid
+        return steering_grid(args.trials, args.out, model=args.model, revision=args.revision, device=args.device,
+                             layers=args.layers, strengths=args.strengths, positions=tuple(args.positions),
+                             random_seeds=tuple(args.random_seeds), temperature=args.temperature,
+                             max_output_tokens=args.max_output_tokens, seed=args.seed, ridge=args.ridge,
+                             limit=args.limit, capability=not args.no_capability)
     raise ValueError("Unknown command")
 
 

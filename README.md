@@ -1,13 +1,22 @@
 # auspicious-investors
 
-Reproducible multilingual experiment framework for studying whether LLMs acting as
-Indian retail investors or financial advisors let calendar-auspiciousness beliefs
-(Dhanteras, Akshaya Tritiya, Diwali Muhurat, Pitru Paksha) shift financial
-recommendations, and whether the effect amplifies when prompted in Indian languages.
+Reproducible multilingual framework for measuring **calendar-cue sensitivity** of LLM
+investment recommendations: do allocation and timing recommendations change when a prompt
+names or implies an Indian auspicious calendar occasion (Dhanteras, Akshaya Tritiya, Diwali
+Muhurat trading, Pitru Paksha) while every economic fact is held fixed, and does that depend on
+prompt language, client persona, and cue type?
 
-> **All shipped data, translations, and prompts are draft research materials.
-> No trial has independent calendar-date verification or human reviewer attestation.
-> Exploratory use only until the review workflow is completed.**
+> **What the estimates mean.** The primary estimand is the effect of *changing specified prompt
+> text* on one model's output under stated inference conditions. It is not evidence that a model
+> "believes" in auspiciousness. A change in gold allocation can come from a festival→"buy gold"
+> association, accommodation of a stated cultural preference, an inferred researcher expectation,
+> or a (mistaken) financial rationale. The controls and outcome decomposition below exist to
+> separate those explanations; stronger language needs stronger evidence.
+>
+> **All shipped prompts, translations, and scenario text are draft.** Nothing has been reviewed by
+> independent bilingual domain reviewers, no calendar date is verified, and the `t2` templates are
+> AI-drafted variants, not independent human authorship. Treat every result as exploratory until
+> the review workflow below is completed.
 
 ---
 
@@ -15,293 +24,304 @@ recommendations, and whether the effect amplifies when prompted in Indian langua
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -e .                    # core + Gemini (stdlib only)
-.venv/bin/pip install -e '.[openweights]'     # + torch/transformers for local models
+.venv/bin/pip install -e .                    # core + Gemini transport (stdlib only)
+.venv/bin/pip install -e '.[openweights]'     # + numpy/torch/transformers for local models
+.venv/bin/python -m unittest discover -s tests
 ```
 
-Python ≥ 3.11. `zoneinfo` tzdata required for `date_only` calendar validation
-(`pip install tzdata` on Windows/some containers).
+Python ≥ 3.11. `date_only` calendar validation needs IANA tzdata (`pip install tzdata` where the
+OS lacks it). If you move the project directory, re-run `pip install -e . --no-deps`.
 
 ---
 
-## Quick start: Gemini pilot run
+## Quick start (Gemini pilot)
 
 ```sh
-# 1  Build the 80-trial pilot (5 languages × 4 festivals × 2 roles × 1 scenario, draft)
-auspicious build --config examples/pilot.json --out runs/pilot.jsonl
-
-# 2  Inspect (no API call)
+auspicious build --config examples/pilot.json --out runs/pilot.jsonl   # 80 draft trials
 auspicious validate --trials runs/pilot.jsonl
 
-# 3  Run — resumes automatically if interrupted
-export GEMINI_API_KEYS='["key-one","key-two","key-three"]'
-auspicious run \
-  --trials runs/pilot.jsonl \
-  --out    runs/pilot-gemini-flash \
-  --model  gemini-2.5-flash \
-  --concurrency 8 \
-  --rpm 60
-
-# 4  Analyze
-auspicious analyze \
-  --records runs/pilot-gemini-flash/records.jsonl \
-  --out     runs/pilot-analysis \
-  --bootstrap 2000
-
-# Review outputs
-cat runs/pilot-analysis/effects.csv
-cat runs/pilot-analysis/language_interactions.csv
+export GEMINI_API_KEYS='["key-one","key-two"]'                         # or GEMINI_API_KEY
+auspicious run --trials runs/pilot.jsonl --out runs/pilot-gemini \
+  --model gemini-2.5-flash --concurrency 8 --rpm 60                    # resumable
+auspicious analyze --records runs/pilot-gemini/records.jsonl --out runs/pilot-analysis
 ```
 
-Full design (5,760 trials): replace `examples/pilot.json` with `data/full-config.json`.
+`examples/pilot-controls.json` builds the same kind of pilot with all three control arms and both
+templates (10 trials per festival-scenario cell).
 
----
-
-## Key commands
-
-| Command | Purpose |
-|---|---|
-| `build` | Deterministic full-factorial trial JSONL from a JSON design |
-| `validate` | Check pair integrity, content hashes, optional review approvals |
-| `review-export` | Export hash-bound attestation manifest for human sign-off |
-| `select` | Create a whole-pair exploratory subset (by festival/language/cue/role/…) |
-| `models` | List Gemini generateContent-capable models for your key |
-| `run` | Resumable Gemini execution with SQLite checkpoint |
-| `run-openweights` | Resumable local HuggingFace decoder execution |
-| `analyze` | Paired clustered effects, language interactions, human comparison |
-| `import-humans` | Validate consented participant CSV → records JSONL |
-| `export-survey` | Prompt-only CSV for human survey delivery |
-| `context` | Descriptive import of sourced external market series |
-| `extract` | Prompt-only final-token residual activations (no generation) |
-| `probe` | Cluster-isolated ridge linear probe on extracted activations |
-
-```sh
-auspicious <command> --help
-```
-
----
-
-## Rate limiting and multi-key throughput
-
-Gemini rate limits are **per project**, not per API key. Multiple keys from the same
-project share the same quota ceiling. The runner uses a single shared token-bucket
-gate across all keys (default `--rpm 30`). Match `--rpm` to the RPM limit shown in
-[AI Studio](https://aistudio.google.com/rate-limit) for your tier and model.
-
-For Tier-2/3 accounts with high RPM ceilings, the Batch API is more efficient for
-large full-design runs. The runner uses the synchronous API; adapt `gemini.py` to
-batch calls if needed.
+Rate limits are **per Google project, not per API key**. The runner applies one shared request-start
+gate across all keys (`--rpm`); set it from your tier's limit in AI Studio. Extra keys from the same
+project do not add throughput.
 
 ---
 
 ## Experimental design
 
-### Stimuli
+### Trials are counterfactual pairs with optional control arms
 
-Trials are counterfactual pairs: event (festival named or dated) vs. neutral (identical
-economics, same role and persona, different calendar label only). Within a pair:
+A **pair** (shared `pair_id`) holds the same task under different calendar text. Every pair has
+`event` and `neutral`; configs may add controls (`controls` in the config):
 
-- All economic parameters are identical
-- Market access, prices, fees, expected returns, and liquidity constraints are fixed
-- The only varying text is the calendar label (and optional cultural context sentence)
+| Condition | Calendar text | Purpose |
+|---|---|---|
+| `event` | Festival named (or belief sentence, or verified date) | Treatment |
+| `neutral` | "An ordinary comparison day with no designated observance" | Original baseline |
+| `no_calendar` | None (economic disclaimer kept, no calendar label) | Is "ordinary day" itself a cue? |
+| `occasion_control` | A culturally meaningful occasion with **no** auspiciousness/purchase claim | Occasion salience vs auspiciousness |
+| `purchase_control` | Gold-buying (or purchase-deferral) wording **without** any festival | Purchase association vs auspiciousness |
 
-**Three cue conditions** (separate experimental arms, not merged):
+All economic parameters, role, persona, language, template and scenario are identical across a
+pair; only the calendar text varies. The existing economic disclaimer (prices, fees, returns, risk,
+liquidity, market access and hours are exactly as stated; no festival discounts) stays in every
+arm that mentions a label. `occasion_control` and `purchase_control` are not defined for
+`date_only` and the builder refuses that combination.
 
-| Cue | What changes event vs. neutral |
+### Cues, personas, languages, templates
+
+- **Cues:** `festival_named`, `explicit_belief` (one sentence stating that some communities consider
+  the occasion auspicious, with no instruction to follow it), `date_only` (needs researcher-supplied
+  verified calendar pairs; none are bundled — see `data/calendar-empty.json`).
+- **Personas:** `unspecified` (spontaneous baseline), `observant`, `nonobservant`. Personas state
+  observance directly; none are inferred from region or religion.
+- **Languages:** `en`, `hi`, `ta`, `gu`, `bn`. Each language holds several **templates**
+  (`t1`, `t2`; config `templates`). Language effects are bundled with wording, register and
+  fluency — see *Limits*. Independent bilingual review and independently authored templates
+  are required before interpreting language interactions.
+- **Scenarios:** 12 (4 train / 4 dev / 4 test), varying goal, horizon, liquidity need, return and
+  volatility, including cases where stated gold return exceeds equity return, so gold is not
+  uniformly dominated. Scenario is the clustering unit and the train/dev/test split unit.
+
+### Shipped configs
+
+| Config | Pairs | Trials | Notes |
+|---|---:|---:|---|
+| `examples/pilot.json` | 40 | 80 | 5 languages × 4 festivals × 2 roles, one scenario |
+| `data/full-config.json` | 2,880 | 14,400 | `festival_named`, 3 controls, 2 templates, 12 scenarios, 3 personas |
+| `data/belief-config.json` | 2,880 | 14,400 | same, `explicit_belief` cue |
+
+`build` reports `distinct_prompts` and `distinct_neutral_prompts`. Neutral and control prompts are
+textually identical across festivals (different trial ids and sampling seeds), so they act as
+repeated sampling, not additional situations. **Scenario diversity, not prompt count, limits what
+the intervals can support.**
+
+### Outcomes: three separate questions
+
+Model output is JSON with `gold_pct`, `equity_pct`, `cash_pct`, `buy_now`, `timing_days`,
+`willingness_to_pay_inr`, `expected_return_pct`, `rationale`. Allocation must sum to 100;
+`buy_now` iff `timing_days == 0`; `timing_days` ≤ the scenario's permitted delay. Violations are
+recorded as `invalid`, never repaired.
+
+| Question | Outcome | Definition |
+|---|---|---|
+| Did the allocation/timing change? | `gold_pct`, `equity_pct`, `buy_now`, `timing_days` | event − comparison, within pair |
+| Did the model contradict a supplied assumption? | `return_claim_deviation_pp` | `expected_return_pct − stated gold expected return` |
+| Did the plan fail a defined requirement? | `reserve_shortfall_pct`, `reserve_violation` | The prompt requires the liquid reserve to be held **entirely in cash**; shortfall = `max(0, 100·reserve/capital − cash_pct)`; violation if > 0.01 pp |
+| (valuation) | `wtp_premium_pct` | `100·(willingness_to_pay − unit price)/unit price` |
+
+`cash_pct` is determined by gold and equity: it is reported but flagged
+`derived_from_allocation` and excluded from multiplicity families, and `buy_now` is tied to
+`timing_days`. These are not independent confirmations of one finding.
+
+### What each contrast separates
+
+| Contrast | Reads as |
 |---|---|
-| `festival_named` | Festival name vs. "ordinary comparison day" |
-| `explicit_belief` | + one-sentence cultural note (not an instruction to follow it) |
-| `date_only` | A verified local calendar date (researcher-supplied; not bundled) |
+| `event_minus_neutral` (**primary**) | Calendar-cue sensitivity |
+| `event_minus_no_calendar` | Cue vs. no calendar text at all |
+| `neutral_minus_no_calendar` | Whether the "ordinary day" label itself acts as a cue |
+| `event_minus_occasion_control` | Auspiciousness vs. generic occasion salience |
+| `event_minus_purchase_control` | Auspiciousness vs. gold/purchase association |
+| persona interactions (observant − nonobservant) | Preference accommodation |
+| cue interactions (`explicit_belief` − `festival_named`) | Effect of stating the belief |
+| `return_claim_deviation_pp`, `reserve_violation` effects | Unsupported return claims; violated constraints |
 
-**Languages:** `en`, `hi`, `ta`, `gu`, `bn` — each an independently authored template,
-not a translation of English. Draft status; require native-speaker review.
-
-**Personas:** `unspecified` (baseline), `observant`, `nonobservant` — crossed with all
-cues. The `explicit_belief` belief sentence describes third-party practice, never
-instructs the persona.
-
-### Outcomes
-
-Seven measured per trial: `gold_pct`, `equity_pct`, `cash_pct` (allocation), `buy_now`
-(immediate execution), `timing_days` (days delay), `willingness_to_pay_inr` (premium
-willing to pay for one gold unit), `expected_return_pct` (stated gold return belief).
-
-All outcomes are model-reported JSON. Invalid responses (parse failure, constraint
-violation) are preserved as `invalid`, never imputed as zero or discarded silently.
-
-### Analysis
-
-Effects are **paired event-minus-neutral within scenario cluster**, averaged:
-1. Repetitions within subject/scenario (eliminates pseudoreplication)
-2. Subjects within scenario
-3. Scenarios equally (not proportional to trial count)
-
-Language interactions subtract English effects from other-language effects on matched
-tasks. CIs are 95% percentile bootstrap resampling scenarios (not independent
-generations). All unadjusted and exploratory unless preregistered.
+Language interactions are against English on **identical** matched tasks.
 
 ---
 
-## Confirmatory workflow
+## Analysis
 
 ```sh
-# 1  Set confirmatory mode in config BEFORE exporting review
-#    Edit full-config.json: "mode": "confirmatory"
+auspicious analyze --records runs/full-gemini/records.jsonl --out runs/analysis \
+  --bootstrap 2000 --prereg prereg.json
+```
 
-# 2  Export review manifest for attestation
+Estimates average repetitions within scenario, then weight scenarios equally; 95% intervals
+resample **scenarios** (not generations). More bootstrap draws cannot add scenarios.
+
+Written to `--out`: `analysis.json` plus CSVs — `effects`, `language_interactions`,
+`persona_interactions`, `cue_interactions`, `scenario_effects`, `scenario_robustness`
+(n scenarios, share with the pooled sign, min/max), `template_effects` (when >1 template),
+`validity_effects`, `bounds_effects`, `missingness`, `pair_coverage`, `exclusions`,
+`record_status_totals`, and human tables when supplied (below).
+
+- **Validity is an outcome.** `validity_effects.csv` gives P(valid) differences over *all attempted*
+  pairs plus valid-rate breakdowns by language, festival, cue, role, persona and condition.
+  Complete-case effects describe the surviving subset of tasks; if one language fails more on hard
+  scenarios its effect describes different tasks.
+- **Exclusion sensitivity.** `bounds_effects.csv` gives worst-case (Manski-type) bounds for bounded
+  metrics, imputing every non-valid side with the extreme of the metric's support. Unbounded
+  metrics are skipped with a reason. Pairs entirely absent from the results cannot be bounded.
+- **Multiplicity and preregistration.** Without `--prereg` every row is exploratory,
+  Benjamini–Hochberg adjusted (bootstrap two-sided p-values with add-one). With a prereg file
+  (`examples/prereg-example.json` — illustrative placeholders, not a preregistration) the declared
+  primary contrasts are Holm-adjusted as their own family and flagged `exceeds_mme` / `within_mme`
+  against the stated minimum meaningful effect; unmatched primary entries are reported loudly.
+  The report records the prereg file's SHA-256 and the number of exploratory tests (the full
+  design yields on the order of 10³ metric-level estimates).
+- **Preregistration is separate from the hash-bound review workflow.** Review hashes protect the
+  *materials*; a statistical preregistration must additionally fix hypotheses, exclusions, stopping
+  rules and analysis decisions.
+
+---
+
+## Confirmatory workflow (materials)
+
+```sh
+# set "mode": "confirmatory" in the config BEFORE exporting
 auspicious review-export --config data/full-config.json --out review/manifest.json
-
-# 3  Researchers edit manifest.json: set decision="approved", reviewer, approved_at
-#    (one entry per language content block + design block; not per trial)
-
-# 4  Add review_path to config:
-#    "review_path": "review/manifest.json"
-
-# 5  Build confirmatory corpus
+# reviewers edit decision / reviewer / approved_at per scope
+# (design, calendar, and each language:<lang>:<template>); add "review_path" to the config
 auspicious build --config data/full-config.json --out runs/confirmatory.jsonl
-
-# 6  Run — the full corpus check rejects any subset
-auspicious run --trials runs/confirmatory.jsonl --out runs/confirmatory-run \
+auspicious validate --trials runs/confirmatory.jsonl --confirmatory
+auspicious run --trials runs/confirmatory.jsonl --out runs/confirmatory-gemini \
   --model gemini-2.5-flash --confirmatory --concurrency 8 --rpm 60
 ```
 
-Confirmatory runs reject: draft review status, content hash mismatches, any subset of
-the reviewed design, prompt text edits after approval, changed economic parameters, and
-incompatible provider settings.
-
----
-
-## date_only cue
-
-The `date_only` cue requires researcher-supplied verified calendar pairs. No dates are
-bundled; `data/calendar-empty.json` shows the schema. Each pair requires:
-
-- Verified `event_date` and `neutral_date` (ISO YYYY-MM-DD)
-- `locality`, `timezone` (IANA), `verification_method`, `verified_by`, `verified_at`
-- Sources with `url` and `accessed_on` for both dates
-- Explicit `"verified": true` attestation
-
-The economic parameters fix market access identically on both dates ("trading is
-available with identical hours regardless of actual market closures"), so the calendar
-date is the only varying element.
-
----
-
-## Probe and steering (open-weight models)
-
-```sh
-# Extract prompt-only residuals (no generation; no priming)
-auspicious select --trials runs/full.jsonl --festival dhanteras --out runs/dhanteras.jsonl
-auspicious extract --trials runs/dhanteras.jsonl --out runs/features.npz \
-  --model meta-llama/Llama-3.2-1B-Instruct --layer -1
-
-# Fit cluster-isolated ridge probe (train/dev/test never share clusters)
-auspicious probe --activations runs/features.npz --out runs/probe.npz
-
-# Steered inference (positive = toward event; negative = toward neutral)
-auspicious run-openweights --trials runs/dhanteras.jsonl \
-  --out runs/steered-positive --model meta-llama/Llama-3.2-1B-Instruct \
-  --steering-path runs/probe.npz --strength 1 --layer -1
-
-# Norm-matched random direction control (same strength, same norm, different direction)
-auspicious run-openweights --trials runs/dhanteras.jsonl \
-  --out runs/steered-random --model meta-llama/Llama-3.2-1B-Instruct \
-  --steering-path runs/probe.npz --strength 1 --layer -1 --random-direction-seed 42
-```
-
-**What probing and steering establish and do not establish:**
-
-- The probe detects event-vs-neutral calendar-salience in activations. It does not
-  identify an "auspiciousness neuron" or a causally specific circuit.
-- The probe label is `event` (any festival, including avoidance Pitru Paksha) vs.
-  `neutral`. Mixed-valence datasets require separate probes; the tool enforces this.
-- Steering changes downstream behavior in the tested setting. It does not prove causal
-  mediation or rule out that the direction encodes other correlated properties (language,
-  gold semantics, sentiment, topic).
-- The random-direction control checks specificity; it is diagnostic, not a calibrated
-  significance test. Activation patching would strengthen causal claims.
-- Probe accuracy on the test split and steering specificity on non-festival decisions
-  (arithmetic, risk sensitivity, refusals) should both be reported.
+Review materials live **once per corpus** in `<trials>.review.json` (each trial carries only
+`context_sha256`). Confirmatory runs reject: draft status, a missing or tampered sidecar, content or
+approval hash mismatches, prompt edits, any subset of the reviewed design, and `--limit`. Approvals
+are attributable attestations, not cryptographic identity verification.
 
 ---
 
 ## Human comparison
 
+The human estimand is the same event − neutral effect on the same trials. Participants who see both
+halves of a near-identical pair can infer the purpose, so **no participant receives two trials from
+the same pair or the same scenario**:
+
 ```sh
-# Export survey (prompts only; no model outputs)
-auspicious export-survey --trials runs/dhanteras.jsonl --out surveys/dhanteras-prompts.csv
-
-# After collecting IRB-approved participant responses:
-auspicious import-humans \
-  --trials runs/dhanteras.jsonl \
-  --csv    surveys/responses.csv \
-  --out    runs/human-records.jsonl
-
-# Analyze with human comparison
-auspicious analyze \
-  --records runs/dhanteras-run/records.jsonl \
-  --humans  runs/human-records.jsonl \
-  --out     runs/comparison-analysis
+auspicious assign-participants --trials runs/full.jsonl --out surveys/run1 \
+  --participants 240 --design between --items-per-participant 8 \
+  --filler-fraction 0.25 --language en --language hi --seed 7
+#   design `between`: each participant sees one arm (event or neutral) throughout
+#   design `counterbalanced`: conditions vary only across different scenarios
+# outputs: assignments.csv, surveys/<subject>.csv (prompts only, no condition metadata),
+#          design.json (balance statistics), participants-template.csv
 ```
 
-Human response CSV columns: `trial_id,subject_id,gold_pct,equity_pct,cash_pct,buy_now,
-timing_days,willingness_to_pay_inr,expected_return_pct,rationale`
+Fillers are `no_calendar` trials from scenarios not otherwise used by that participant (the corpus
+must include `no_calendar`). Then:
 
-`buy_now` accepts `true/false` or `1/0`. Invalid cells become `invalid` records,
-never imputed. Duplicate `(subject_id, trial_id)` pairs abort import.
+```sh
+auspicious import-humans --trials runs/full.jsonl --csv responses.csv --out runs/humans.jsonl
+auspicious import-participants --csv participants.csv --out runs/participants.json
+auspicious analyze --records runs/full-gemini/records.jsonl --humans runs/humans.jsonl \
+  --participants runs/participants.json --human-design auto --out runs/compare
+```
 
-Human comparisons require identical trial IDs, prompts, and task metadata.
-The LLM–human comparison estimand is model-effect minus human-effect on the same tasks.
-It does not adjust for human sample representativeness.
+`--human-design auto` picks `unpaired` (between-subject/counterbalanced; per pair, event responders
+minus neutral responders, subjects and scenarios both resampled) or `within` (a subject answered
+both conditions), and refuses to guess on mixed data. Participant covariates — `survey_language`,
+`language_proficiency` (1–5), `financial_literacy` (your instrument's numeric score),
+`observance_self_report` (1–5) — are measured, never assumed from the assigned persona, and are
+used for descriptive heterogeneity only. Invalid answers stay invalid; nothing is imputed.
+`examples/human-format.csv` and `examples/participants-format.csv` are header-only. Even a clean
+comparison concerns these hypothetical tasks, not real investing; get ethics approval and
+document recruitment before collecting data.
+
+Contextual market series (`auspicious context --csv …`, columns `date,series,value,unit,source,event`)
+remain descriptive and are never pooled with allocations.
 
 ---
 
-## External contextual data
+## Open-weight probing and steering
+
+Establish the **behavioral** result with the controls above first; only then ask about
+representations.
 
 ```sh
-auspicious context --csv data/gold-imports.csv --out runs/context
+auspicious select --trials runs/full.jsonl --festival dhanteras --festival akshaya_tritiya \
+  --cue festival_named --out runs/aus.jsonl                # single event valence required
+auspicious extract --trials runs/aus.jsonl --out runs/act.npz --model $MODEL --layer 16
+auspicious probe --activations runs/act.npz --out runs/probe.npz
 ```
 
-CSV columns: `date,series,value,unit,source,event`
+The probe predicts event vs neutral (calendar salience; **not** "auspiciousness" — a separate probe
+is needed for avoidance valence). Its report includes controls meant to stop probe accuracy from
+being over-read:
 
-Each `(series,unit,source)` is kept as a separate time series. Seasonal patterns
-in import volumes and Muhurat-session returns are descriptive context, not causal
-estimates of individual auspiciousness beliefs. Do not pool or convert these series
-into allocation percentages.
+- `text_baseline` — hashed character n-gram ridge classifier on the same cluster splits, and
+  `probe_vs_text_baseline`. A probe that does not beat the text baseline does not support a
+  representation claim.
+- `transfer` — leave-one-value-out over festival, language, template and paraphrase (train-split
+  clusters of other values; scored on test-split clusters of the held-out value). The language
+  holdout is cross-language transfer.
+- `random_direction_null` — accuracy of 200 norm-matched random directions (diagnostic, not a
+  calibrated test).
 
-See `examples/context-format.csv` for the column format.
+Steering and its checks:
+
+```sh
+# one steered run (positive strength -> toward event); positions: all | prompt_last | generated
+auspicious run-openweights --trials runs/aus.jsonl --out runs/steer --model $MODEL \
+  --steering-path runs/probe.npz --strength -2 --steering-positions generated
+# arithmetic/financial capability, with the same steering settings
+auspicious capability --out runs/cap.json --model $MODEL --steering-path runs/probe.npz --strength -2
+# layer x position x strength grid, random-direction controls, test-split trials only
+auspicious steering-grid --trials runs/aus.jsonl --out runs/grid --model $MODEL \
+  --layers 8 12 16 --strengths -4 -2 2 4 --positions all prompt_last generated \
+  --random-seeds 1 2 3 4 5
+```
+
+(Use space-separated lists; `--strengths -4 -2` is valid.) The grid fits each probe on train-split
+clusters and evaluates steering on **test**-split pairs only, with a zero-strength baseline per
+layer, norm-matched random directions, and a capability check per cell. Compare behavior against
+baseline, random directions, validity rate, and capability; the analysis step keeps steered runs in
+separate strata (steering settings are part of the generation identity). `data/capability.json` is
+draft, AI-authored arithmetic items.
+
+A steering vector that moves outputs shows a causally effective direction in the tested setting. It
+does **not** show that the direction mediates the original date effect or is specific to
+auspiciousness; that needs activation patching or ablation plus the controls above.
 
 ---
 
-## Scientific limits
+## Commands
 
-- **Identification:** Date/festival salience in the prompt is not randomised across
-  model versions or real time. The counterfactual pair controls economic content but
-  not the full information environment a model may encode.
-- **Multilingual:** Draft templates are researcher-authored, not independently reviewed.
-  Language effects bundle fluency, script, register, and cultural framing. Translation
-  quality must be validated by competent bilingual domain reviewers before
-  multilingual interaction effects are interpreted.
-- **Representation:** LLM responses to synthetic vignettes are not observations of
-  real household decisions. Thousands of generations from one template are not
-  thousands of independent investors.
-- **Probing and steering:** The probe direction may encode correlated properties.
-  The single label-flip control is diagnostic; calibrated permutation significance
-  requires more.
-- **Human comparison:** The comparison estimates model-effect minus human-effect on the
-  same synthetic tasks. It does not estimate the effect of LLM use on real investment
-  decisions.
-- **Preregistration:** Exploratory results must not be treated as confirmatory without
-  prospective preregistration and the full review workflow.
+| Command | Purpose |
+|---|---|
+| `build` / `review-export` / `validate` / `select` | Corpus construction, review, integrity, whole-pair subsets |
+| `models` / `run` / `run-openweights` | Gemini and local execution (resumable journals) |
+| `analyze` | Contrasts, interactions, validity, bounds, multiplicity, human comparison |
+| `assign-participants` / `import-humans` / `import-participants` | Human design, responses, covariates |
+| `context` | Descriptive external series |
+| `extract` / `probe` / `capability` / `steering-grid` | Representation and steering |
+
+`auspicious <command> --help` lists options. Credentials come from `GEMINI_API_KEY`,
+`GOOGLE_API_KEY`, or `GEMINI_API_KEYS` (JSON array); they are never written to records, logs, or
+manifests.
 
 ---
 
-## Credentials
+## Limits
 
-```sh
-export GEMINI_API_KEY=your-key          # single key
-export GEMINI_API_KEYS='["k1","k2"]'   # JSON array for multiple keys
-```
-
-Keys are never written to disk, logs, or result files. The runner checks this
-explicitly. Do not commit `.env` files; `.gitignore` excludes them.
+- **Construct validity:** a cue effect is not a belief. Use the controls and decomposition;
+  report which explanations remain open.
+- **Language:** wording, register and fluency are confounded with language. Independent bilingual
+  review and independently authored templates are required; `t2` is an AI-drafted variant.
+- **Sample size:** 12 scenarios from one author set. Intervals describe the sampled scenarios; the
+  design warns when fewer than 8 are present. Prefer more scenarios and independent prompt authors
+  to more repetitions.
+- **Outcomes:** gold allocation has no uniquely correct value when risk tolerance is unspecified;
+  `wtp_premium_pct` benchmarks against the quoted unit price only. Reserve violation uses the
+  prompt's cash-only definition.
+- **Missingness:** complete-case effects, validity effects and bounds answer different questions;
+  report all three.
+- **Probing/steering:** see above; the single label-flip control stored in the probe report and the
+  random-direction null are diagnostics.
+- **Humans:** hypothetical tasks; recruitment, assignment and ethics approval are your
+  responsibility.
+- **Statistics:** intervals are unadjusted percentile bootstrap; multiplicity adjustment applies to
+  the bootstrap p-values only. Preregister primary contrasts and minimum effects before collection.

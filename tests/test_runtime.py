@@ -13,18 +13,19 @@ def payload():
             "rationale": "Keep emergency liquidity and diversify."}
 
 
-def trials():
+def trials(conditions=("event", "neutral"), pair_ids=("pair",)):
     rows = []
-    for condition in ("event", "neutral"):
-        prompt = "Financial decision " + condition
-        rows.append({"trial_id": hashlib.sha256(prompt.encode()).hexdigest(),
-                     "pair_id": "pair", "cluster_id": "scenario", "split": "test",
-                     "language": "en", "festival": "dhanteras", "condition": condition,
-                     "event_valence": "auspicious", "cue": "festival_named", "role": "investor",
-                     "persona_id": "unspecified", "scenario_id": "scenario", "paraphrase_id": "p1",
-                     "replicate": 0, "prompt": prompt,
-                     "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-                     "review_status": "draft", "review": {}})
+    for pair_id in pair_ids:
+        for condition in conditions:
+            prompt = f"Financial decision {pair_id} {condition}"
+            rows.append({"trial_id": hashlib.sha256(prompt.encode()).hexdigest(),
+                         "pair_id": pair_id, "cluster_id": "scenario", "split": "test",
+                         "language": "en", "festival": "dhanteras", "condition": condition,
+                         "event_valence": "auspicious", "cue": "festival_named", "role": "investor",
+                         "persona_id": "unspecified", "scenario_id": "scenario", "paraphrase_id": "p1",
+                         "template_id": "t1", "replicate": 0, "prompt": prompt,
+                         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                         "review_status": "draft", "review": {}})
     return rows
 
 
@@ -125,6 +126,33 @@ class JournalTests(unittest.TestCase):
         rows[1]["split"] = "train"
         with self.assertRaisesRegex(ValueError, "leaks"):
             validate_trials(rows)
+
+    def test_control_arms_are_part_of_the_pair(self):
+        rows = trials(("event", "neutral", "no_calendar", "purchase_control"))
+        validate_trials(rows)
+        rows[3]["template_id"] = "t2"
+        with self.assertRaisesRegex(ValueError, "mismatches template_id in purchase_control"):
+            validate_trials(rows)
+
+    def test_every_pair_must_carry_the_same_controls(self):
+        rows = trials(("event", "neutral", "no_calendar"), ("a",)) + trials(("event", "neutral"), ("b",))
+        with self.assertRaisesRegex(ValueError, "inconsistent condition sets"):
+            validate_trials(rows)
+
+    def test_limit_keeps_whole_pairs_with_all_conditions(self):
+        rows = trials(("event", "neutral", "no_calendar"), ("a", "b", "c"))
+        path = self.root / "controls.jsonl"
+        write_jsonl(path, rows)
+        summary = run_trials(path, self.root / "limited", CountingProvider(), concurrency=1, limit=7)
+        self.assertEqual(summary["selected"], 6)
+        stored = read_jsonl(self.root / "limited" / "records.jsonl")
+        by_pair = {}
+        for record in stored:
+            by_pair.setdefault(record["trial"]["pair_id"], set()).add(record["trial"]["condition"])
+        self.assertEqual(len(by_pair), 2)
+        self.assertTrue(all(c == {"event", "neutral", "no_calendar"} for c in by_pair.values()))
+        with self.assertRaisesRegex(ValueError, "limit must be >= 3"):
+            run_trials(path, self.root / "tiny", CountingProvider(), limit=2)
 
 
 if __name__ == "__main__":

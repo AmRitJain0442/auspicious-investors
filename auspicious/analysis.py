@@ -1,7 +1,11 @@
-"""Complete-case, scenario-clustered analyses; contextual series are descriptive only.
+"""Scenario-clustered calendar-cue sensitivity analyses; contextual series are descriptive only.
 
-All contrasts are event minus neutral. Repeated prompts are averaged within
-scenario, not counted as independent observations. No outcomes are imputed.
+Estimates describe how a particular model's (or human sample's) answers change when
+specified prompt text changes. They are NOT measurements of beliefs or of causal
+mediation. Contrasts are A-minus-B over matched conditions of the same pair; repeated
+prompts are averaged within scenario, never counted as independent observations. No
+outcome is imputed in the main tables; the bounds table shows how much missing answers
+could matter.
 """
 from __future__ import annotations
 
@@ -10,24 +14,35 @@ import hashlib
 import json
 import math
 import random
+import re
 from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, median
 
-from .core import load_records, normalize_result, read_jsonl, validate_trials, write_jsonl
+from .core import load_records, normalize_result, read_jsonl, strict_json, validate_trials, write_jsonl
 
-METRICS = (
+PAYLOAD_METRICS = (
     "gold_pct", "equity_pct", "cash_pct", "buy_now", "timing_days",
     "willingness_to_pay_inr", "expected_return_pct",
 )
+DERIVED_METRICS = (
+    "return_claim_deviation_pp", "reserve_shortfall_pct", "reserve_violation", "wtp_premium_pct",
+)
+METRICS = (*PAYLOAD_METRICS, *DERIVED_METRICS)
+# cash_pct is 100 - gold - equity by construction: reported, never a separate finding.
+DERIVED_FROM_ALLOCATION = frozenset({"cash_pct"})
 UNITS = {
     "gold_pct": "percentage_points", "equity_pct": "percentage_points",
     "cash_pct": "percentage_points", "buy_now": "probability_difference",
     "timing_days": "days", "willingness_to_pay_inr": "INR",
     "expected_return_pct": "percentage_points_annual_expected_return",
+    "return_claim_deviation_pp": "percentage_points_annual_expected_return",
+    "reserve_shortfall_pct": "percentage_points_of_capital",
+    "reserve_violation": "probability_difference",
+    "wtp_premium_pct": "percent_of_gold_unit_price",
 }
-PAYLOAD_FIELDS = (*METRICS, "rationale")
+PAYLOAD_FIELDS = (*PAYLOAD_METRICS, "rationale")
 HUMAN_FIELDS = ("trial_id", "subject_id", *PAYLOAD_FIELDS)
 CONTEXT_FIELDS = ("date", "series", "value", "unit", "source", "event")
 GROUP_FIELDS = (
@@ -36,11 +51,50 @@ GROUP_FIELDS = (
 )
 TASK_FIELDS = (
     "cluster_id", "scenario_id", "split", "festival", "cue", "role",
-    "persona_id", "paraphrase_id", "replicate", "event_valence",
+    "persona_id", "paraphrase_id", "template_id", "replicate", "event_valence",
 )
 PAIR_FIELDS = (*TASK_FIELDS, "language")
 OPTIONAL_TASK_FIELDS = ("calendar_pair_id",)
+META_FIELDS = (*PAIR_FIELDS, *OPTIONAL_TASK_FIELDS, "economics")
 STATUSES = ("ok", "invalid", "blocked", "error")
+CONDITIONS = ("event", "neutral", "no_calendar", "occasion_control", "purchase_control")
+CONTRASTS = {
+    "event_minus_neutral": ("event", "neutral"),
+    "event_minus_no_calendar": ("event", "no_calendar"),
+    "event_minus_occasion_control": ("event", "occasion_control"),
+    "event_minus_purchase_control": ("event", "purchase_control"),
+    "neutral_minus_no_calendar": ("neutral", "no_calendar"),
+}
+PRIMARY_CONTRAST = "event_minus_neutral"
+# (trial/group field, label, reference level, table name)
+INTERACTIONS = (
+    ("language", "language", "en", "language_interactions"),
+    ("persona_id", "persona", "nonobservant", "persona_interactions"),
+    ("cue", "cue", "festival_named", "cue_interactions"),
+)
+MULTIPLICITY_TABLES = tuple(spec[3] for spec in INTERACTIONS)
+FAMILY_TABLES = ("effects", *MULTIPLICITY_TABLES)
+HUMAN_DESIGNS = ("auto", "within", "unpaired")
+ECONOMICS_NUMBERS = ("capital_inr", "gold_unit_price_inr", "liquidity_need_inr",
+                     "gold_expected_annual_pct", "max_delay_days")
+# Support of each bounded metric for worst-case (Manski-type) imputation.
+BOUNDED = {
+    "gold_pct": (0.0, 100.0), "equity_pct": (0.0, 100.0), "cash_pct": (0.0, 100.0),
+    "buy_now": (0.0, 1.0), "reserve_violation": (0.0, 1.0),
+}
+MIN_SCENARIOS_FOR_GENERAL_CLAIMS = 8
+PARTICIPANT_REQUIRED = ("subject_id", "survey_language", "language_proficiency",
+                        "financial_literacy", "observance_self_report")
+PARTICIPANT_OPTIONAL = ("age_band", "region")
+PARTICIPANT_LANGUAGES = ("en", "hi", "ta", "gu", "bn")
+VALIDITY_DIMENSIONS = (("all", None), ("language", 4), ("festival", 5), ("cue", 6),
+                       ("role", 7), ("persona", 8), ("condition", "condition"))
+PREREG_KEYS = {"schema_version", "primary", "primary_adjustment", "exploratory_adjustment", "_note"}
+PREREG_ENTRY_KEYS = {"id", "table", "metric", "contrast", "filters", "minimum_meaningful_effect"}
+PREREG_FILTER_KEYS = (*GROUP_FIELDS, "source")
+EXPLORATORY_ADJUSTMENTS = ("benjamini_hochberg", "holm", "none")
+INFERENCE_FIELDS = ("p_value", "family", "primary_id", "p_adjusted", "adjustment", "n_family",
+                    "minimum_meaningful_effect", "exceeds_mme", "within_mme", "derived_from_allocation")
 
 
 def _canonical(value):
@@ -60,7 +114,7 @@ def _json_write(path, value):
                                     indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _csv_read(path, fields):
+def _csv_read(path, fields, allowed=None):
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or len(reader.fieldnames) != len(set(reader.fieldnames)):
@@ -68,6 +122,8 @@ def _csv_read(path, fields):
         missing = set(fields) - set(reader.fieldnames)
         if missing:
             raise ValueError(f"{path}: missing CSV columns: {', '.join(sorted(missing))}")
+        if allowed is not None and set(reader.fieldnames) - set(allowed):
+            raise ValueError(f"{path}: unknown CSV columns: {', '.join(sorted(set(reader.fieldnames) - set(allowed)))}")
         rows = []
         for line, row in enumerate(reader, 2):
             if None in row or any(row[field] is None for field in fields):
@@ -90,6 +146,34 @@ def _normalize_payload(result, trial):
         return normalize_result(candidate, trial=trial)
     except (ValueError, TypeError, OverflowError) as exc:
         return {**result, "status": "invalid", "payload": None, "error": str(exc)}
+
+
+def _economics(trial):
+    economics = trial.get("economics")
+    if not isinstance(economics, dict):
+        raise ValueError("missing or invalid trial economics")
+    for key in ECONOMICS_NUMBERS:
+        value = economics.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"missing or invalid trial economics.{key}")
+    if economics["capital_inr"] <= 0 or economics["gold_unit_price_inr"] <= 0:
+        raise ValueError("economics capital_inr and gold_unit_price_inr must be positive")
+    if economics["liquidity_need_inr"] < 0 or economics["max_delay_days"] < 0:
+        raise ValueError("economics liquidity_need_inr and max_delay_days must be nonnegative")
+    return economics
+
+
+def _metrics(payload, economics):
+    """Seven reported payload metrics plus four derived ones (all floats)."""
+    values = {name: float(payload[name]) for name in PAYLOAD_METRICS}
+    shortfall = max(0.0, 100.0 * economics["liquidity_need_inr"] / economics["capital_inr"]
+                    - values["cash_pct"])
+    price = economics["gold_unit_price_inr"]
+    values["return_claim_deviation_pp"] = values["expected_return_pct"] - economics["gold_expected_annual_pct"]
+    values["reserve_shortfall_pct"] = shortfall
+    values["reserve_violation"] = 1.0 if shortfall > 0.01 else 0.0
+    values["wtp_premium_pct"] = 100.0 * (values["willingness_to_pay_inr"] - price) / price
+    return values
 
 
 def _group(trial, result):
@@ -130,30 +214,74 @@ def _interval(draws):
     return (_percentile(draws, .025), _percentile(draws, .975)) if draws else (None, None)
 
 
-def _cluster_values(pairs, metric):
+def _bootstrap_p(draws):
+    """Two-sided add-one bootstrap p: min(1, 2*min(#(b<=0)+1, #(b>=0)+1)/(B+1))."""
+    if not draws:
+        return None
+    below = sum(1 for value in draws if value <= 0)
+    above = sum(1 for value in draws if value >= 0)
+    return min(1.0, 2.0 * min(below + 1, above + 1) / (len(draws) + 1))
+
+
+def _cluster_values(pairs, metric, field="diff"):
     # Equal subject weighting within each scenario, then equal scenario weighting.
     cells = defaultdict(list)
     for pair in pairs:
-        cells[(pair["cluster"], pair["subject"])].append(pair["diff"][metric])
+        cells[(pair["cluster"], pair["subject"])].append(pair[field][metric])
     clusters = defaultdict(list)
     for (cluster, _subject), values in cells.items():
         clusters[cluster].append(fmean(values))
     return {cluster: fmean(values) for cluster, values in clusters.items()}
 
 
-def _estimate(values, bootstrap, rng):
-    numbers = [values[key] for key in sorted(values)]
-    if not numbers:
-        return None, None, None
-    draws = []
-    if len(numbers) >= 2 and bootstrap:
-        draws = [fmean(rng.choices(numbers, k=len(numbers))) for _ in range(bootstrap)]
-    low, high = _interval(draws)
-    return fmean(numbers), low, high
+def _estimate_all(values_by_metric, bootstrap, rng):
+    """{metric: (estimate, ci_low, ci_high, p_value)}; one scenario resample serves every metric."""
+    names = list(values_by_metric)
+    clusters = sorted({cluster for values in values_by_metric.values() for cluster in values})
+    n = len(clusters)
+    if not n:
+        return {name: (None, None, None, None) for name in names}
+    vectors = {name: [values_by_metric[name][cluster] for cluster in clusters] for name in names}
+    draws = {name: [] for name in names}
+    if n >= 2 and bootstrap:
+        for _ in range(bootstrap):
+            indices = rng.choices(range(n), k=n)
+            for name, vector in vectors.items():
+                draws[name].append(math.fsum([vector[i] for i in indices]) / n)
+    result = {}
+    for name in names:
+        low, high = _interval(draws[name])
+        result[name] = (fmean(vectors[name]), low, high, _bootstrap_p(draws[name]))
+    return result
 
+
+def _ci_reason(low, bootstrap):
+    return "" if low is not None else ("bootstrap_disabled" if not bootstrap else "fewer_than_two_clusters")
+
+
+def _inference_blank(metric):
+    return {"p_value": None, "family": None, "primary_id": None, "p_adjusted": None,
+            "adjustment": None, "n_family": None, "minimum_meaningful_effect": None,
+            "exceeds_mme": None, "within_mme": None,
+            "derived_from_allocation": metric in DERIVED_FROM_ALLOCATION}
+
+
+def _task_key(pair, omit=None):
+    return (pair["subject"], *(pair["a"].get(field) for field in
+                              (*TASK_FIELDS, *OPTIONAL_TASK_FIELDS) if field != omit))
+
+
+# ---------------------------------------------------------------------------
+# Record parsing and pair assembly
+# ---------------------------------------------------------------------------
 
 def _prepare(records, label):
-    buckets = defaultdict(list)
+    """Parse records into candidates and structurally valid pair buckets.
+
+    A bucket is all records of one (stratum, subject, pair_id). Buckets that are
+    duplicated, internally inconsistent or semantically duplicated are rejected
+    explicitly and never contribute to any contrast.
+    """
     counts = defaultdict(Counter)
     exclusions = []
     warnings = set()
@@ -192,20 +320,22 @@ def _prepare(records, label):
                 value = trial.get(field)
                 if value is not None and (not isinstance(value, str) or not value):
                     raise ValueError(f"invalid trial {field}")
-            if trial.get("condition") not in ("event", "neutral"):
-                raise ValueError("condition must be event or neutral")
+            if trial.get("condition") not in CONDITIONS:
+                raise ValueError(f"condition must be one of {', '.join(CONDITIONS)}")
+            economics = _economics(trial)
             normalized = _normalize_payload(result, trial)
             counts[group][normalized["status"]] += 1
             if group[2] is None:
                 warnings.add("Unresolved model_version is kept in its own stratum; cross-run checkpoint identity cannot be established for that stratum.")
-            item = {"trial": trial, "result": normalized, "group": group,
+            metrics = _metrics(normalized["payload"], economics) if normalized["status"] == "ok" else None
+            item = {"trial": trial, "result": normalized, "group": group, "metrics": metrics,
                     "subject": subject, "index": index, "pair_key": pair_key}
             candidates.append(item)
             duplicates[(group[:4], subject, trial["trial_id"])].append(item)
         except (ValueError, TypeError, KeyError) as exc:
             exclusions.append({"source": label, "record_index": index,
                                "pair_id": trial.get("pair_id", "") if isinstance(trial, dict) else "",
-                               "reason": f"malformed_record: {exc}"})
+                               "contrast": "", "reason": f"malformed_record: {exc}", "detail": ""})
             if pair_key is not None:
                 rejected_pairs.add(pair_key)
             if group is not None:
@@ -215,68 +345,49 @@ def _prepare(records, label):
             for item in items:
                 rejected_pairs.add(item["pair_key"])
             exclusions.append({"source": label, "record_index": ",".join(str(item["index"]) for item in items),
-                               "pair_id": items[0]["trial"]["pair_id"],
-                               "reason": "duplicate_trial_observation: all affected pairs excluded"})
-    # A nominal pair may not cross model versions, generations, or design strata.
+                               "pair_id": items[0]["trial"]["pair_id"], "contrast": "",
+                               "reason": "duplicate_trial_observation: all affected pairs excluded", "detail": ""})
     nominal = defaultdict(set)
+    by_pair = defaultdict(list)
     for item in candidates:
         nominal[(item["group"][:2], item["subject"], item["trial"]["pair_id"])].add(item["group"])
-        buckets[item["pair_key"]].append(item)
+        by_pair[item["pair_key"]].append(item)
     for groups in nominal.values():
         if len(groups) > 1:
             # Complete pairs in separate versions are valid separate experiments;
             # incomplete cross-version fragments remain incomplete, never combined.
             warnings.add("A pair_id occurs in multiple model/design strata; strata are never pooled or paired across versions/settings.")
-    complete = defaultdict(list)
-    coverage = []
-    for pair_key, items in buckets.items():
+    buckets = []
+    for pair_key, items in by_pair.items():
         group, subject, pair_id = pair_key
         reason = None
         conditions = Counter(item["trial"]["condition"] for item in items)
         if pair_key in rejected_pairs:
             reason = "duplicate_or_malformed_record_in_pair"
-        elif conditions != {"event": 1, "neutral": 1}:
-            reason = "incomplete_or_duplicate_condition"
-        elif any(item["result"]["status"] != "ok" for item in items):
-            reason = "non_ok_pair"
-        elif any(items[0]["trial"].get(field) != items[1]["trial"].get(field)
-                 for field in (*PAIR_FIELDS, *OPTIONAL_TASK_FIELDS)):
+        elif any(n > 1 for n in conditions.values()):
+            reason = "duplicate_condition_in_pair"
+        elif any(items[0]["trial"].get(field) != item["trial"].get(field)
+                 for item in items[1:] for field in META_FIELDS):
             reason = "inconsistent_pair_metadata"
+        bucket = {"group": group, "subject": subject, "pair_id": pair_id, "rejected": reason is not None,
+                  "items": {item["trial"]["condition"]: item for item in items}, "records": items}
         if reason:
             exclusions.append({"source": label, "record_index": ",".join(str(item["index"]) for item in items),
-                               "pair_id": pair_id, "reason": reason})
-            continue
-        by_condition = {item["trial"]["condition"]: item for item in items}
-        event, neutral = by_condition["event"], by_condition["neutral"]
-        diff = {metric: float(event["result"]["payload"][metric]) -
-                float(neutral["result"]["payload"][metric]) for metric in METRICS}
-        if not all(math.isfinite(value) for value in diff.values()):
-            exclusions.append({"source": label, "record_index": ",".join(str(item["index"]) for item in items),
-                               "pair_id": pair_id, "reason": "nonfinite_pair_difference"})
-            continue
-        complete[group].append({"pair_id": pair_id, "subject": subject,
-                                "cluster": event["trial"]["cluster_id"], "diff": diff,
-                                "event": event["trial"], "neutral": neutral["trial"]})
+                               "pair_id": pair_id, "contrast": "", "reason": reason, "detail": ""})
+        buckets.append(bucket)
     # Re-labelling a task/pair must not make a duplicate observation independent.
-    for group, pairs in complete.items():
-        semantic = defaultdict(list)
-        for pair in pairs:
-            semantic[_task_key(pair)].append(pair)
-        ambiguous = {key for key, values in semantic.items() if len(values) > 1}
-        if ambiguous:
-            complete[group] = [pair for pair in pairs if _task_key(pair) not in ambiguous]
-            for key in sorted(ambiguous, key=_canonical):
-                exclusions.append({"source": label, "record_index": "",
-                                   "pair_id": ",".join(pair["pair_id"] for pair in semantic[key]),
-                                   "reason": "duplicate_semantic_task: all affected pairs excluded"})
-    for group in sorted(seen_pairs, key=_canonical):
-        n = len(complete[group])
-        total = len(seen_pairs[group])
-        coverage.append({**_group_row(group), "source": label,
-                         "observed_pairs": total, "complete_pairs": n,
-                         "excluded_pairs": total - n,
-                         "complete_pair_coverage": n / total if total else None,
-                         "n_clusters": len({pair["cluster"] for pair in complete[group]})})
+    semantic = defaultdict(list)
+    for bucket in buckets:
+        if not bucket["rejected"]:
+            first = bucket["records"][0]["trial"]
+            semantic[(bucket["group"], bucket["subject"],
+                      *(first.get(field) for field in (*TASK_FIELDS, *OPTIONAL_TASK_FIELDS)))].append(bucket)
+    for key in sorted((key for key, values in semantic.items() if len(values) > 1), key=_canonical):
+        for bucket in semantic[key]:
+            bucket["rejected"] = True
+        exclusions.append({"source": label, "record_index": "",
+                           "pair_id": ",".join(bucket["pair_id"] for bucket in semantic[key]), "contrast": "",
+                           "reason": "duplicate_semantic_task: all affected pairs excluded", "detail": ""})
     missingness = []
     for group in sorted(counts, key=_canonical):
         total = sum(counts[group].values())
@@ -287,67 +398,353 @@ def _prepare(records, label):
                                 "fraction": n / total if total else None})
     if exclusions:
         warnings.add(f"{label}: {len(exclusions)} explicit exclusion entries; inspect exclusions.csv. No missing or invalid outcome was replaced with zero.")
-    return complete, coverage, missingness, exclusions, warnings
+    return {"label": label, "candidates": candidates, "buckets": buckets, "seen": seen_pairs,
+            "missingness": missingness, "exclusions": exclusions, "warnings": warnings}
 
 
-def _effects(groups, bootstrap, seed, source):
+def _select_contrasts(candidates):
+    conditions = {item["trial"]["condition"] for item in candidates}
+    chosen = [name for name, (a, b) in CONTRASTS.items() if a in conditions and b in conditions]
+    # With no computable contrast, report everything as incomplete for the primary one.
+    return chosen or [PRIMARY_CONTRAST]
+
+
+def _contrast_sets(buckets, contrasts, label, exclusions):
+    """Per contrast: complete (both ok) pairs with diffs, and attempted (both recorded) pairs."""
+    complete = {name: defaultdict(list) for name in contrasts}
+    attempted = {name: defaultdict(list) for name in contrasts}
+    for bucket in buckets:
+        if bucket["rejected"]:
+            continue
+        missing, not_ok = [], []
+        for name in contrasts:
+            a_name, b_name = CONTRASTS[name]
+            item_a, item_b = bucket["items"].get(a_name), bucket["items"].get(b_name)
+            if item_a is None or item_b is None:
+                missing.append(name)
+                continue
+            base = {"pair_id": bucket["pair_id"], "subject": bucket["subject"],
+                    "subjects": [bucket["subject"]] if bucket["subject"] is not None else [],
+                    "cluster": item_a["trial"]["cluster_id"]}
+            attempted[name][bucket["group"]].append({**base, "a": item_a, "b": item_b})
+            if item_a["metrics"] is None or item_b["metrics"] is None:
+                not_ok.append(name)
+                continue
+            diff = {metric: item_a["metrics"][metric] - item_b["metrics"][metric] for metric in METRICS}
+            complete[name][bucket["group"]].append({**base, "a": item_a["trial"], "b": item_b["trial"], "diff": diff})
+        indices = ",".join(str(item["index"]) for item in bucket["records"])
+        for reason, names in (("incomplete_pair", missing), ("non_ok_pair", not_ok)):
+            if names:
+                exclusions.append({"source": label, "record_index": indices, "pair_id": bucket["pair_id"],
+                                   "contrast": ";".join(names), "reason": reason, "detail": ""})
+    return {"complete": complete, "attempted": attempted}
+
+
+def _unpaired_sets(buckets, label, exclusions, subjects=None):
+    """Between-subject estimator: each pair's effect is mean(event responders) - mean(neutral responders)."""
+    arms = defaultdict(lambda: {"event": [], "neutral": []})
+    for bucket in buckets:
+        if bucket["rejected"] or (subjects is not None and bucket["subject"] not in subjects):
+            continue
+        present = [name for name in ("event", "neutral") if name in bucket["items"]]
+        if len(present) == 2:
+            raise ValueError(f"human_design=unpaired but subject {bucket['subject']!r} answered both conditions of pair {bucket['pair_id']!r}")
+        for name in present:
+            arms[(bucket["group"], bucket["pair_id"])][name].append(bucket["items"][name])
+    complete = {PRIMARY_CONTRAST: defaultdict(list)}
+    attempted = {PRIMARY_CONTRAST: defaultdict(list)}
+    for (group, pair_id), sides in sorted(arms.items(), key=lambda entry: _canonical(entry[0])):
+        event, neutral = sides["event"], sides["neutral"]
+        indices = ",".join(str(item["index"]) for item in event + neutral)
+        reason = None
+        if not event or not neutral:
+            reason = "incomplete_pair"
+        else:
+            attempted[PRIMARY_CONTRAST][group].append({"pair_id": pair_id})
+            first_event, first_neutral = event[0]["trial"], neutral[0]["trial"]
+            if (any(not _same_task(first_event, item["trial"]) for item in event[1:]) or
+                    any(not _same_task(first_neutral, item["trial"]) for item in neutral[1:]) or
+                    any(first_event.get(field) != first_neutral.get(field) for field in META_FIELDS)):
+                reason = "inconsistent_trial_across_subjects"
+            elif not any(item["metrics"] for item in event) or not any(item["metrics"] for item in neutral):
+                reason = "non_ok_pair"
+        if reason:
+            exclusions.append({"source": label, "record_index": indices, "pair_id": pair_id,
+                               "contrast": PRIMARY_CONTRAST, "reason": reason, "detail": ""})
+            continue
+        event_ok = [(item["subject"], item["metrics"]) for item in event if item["metrics"]]
+        neutral_ok = [(item["subject"], item["metrics"]) for item in neutral if item["metrics"]]
+        diff = {metric: fmean([m[metric] for _, m in event_ok]) - fmean([m[metric] for _, m in neutral_ok])
+                for metric in METRICS}
+        complete[PRIMARY_CONTRAST][group].append({
+            "pair_id": pair_id, "subject": None, "cluster": event[0]["trial"]["cluster_id"],
+            "subjects": sorted({subject for subject, _ in event_ok + neutral_ok}),
+            "a": event[0]["trial"], "b": neutral[0]["trial"], "diff": diff,
+            "event_resp": event_ok, "neutral_resp": neutral_ok})
+    return {"complete": complete, "attempted": attempted}
+
+
+def _resolve_human_design(buckets, requested):
+    if requested != "auto":
+        return requested
+    both, single = set(), set()
+    for bucket in buckets:
+        if bucket["rejected"] or bucket["subject"] is None:
+            continue
+        present = [name for name in ("event", "neutral") if name in bucket["items"]]
+        if len(present) == 2:
+            both.add(bucket["subject"])
+        elif len(present) == 1:
+            single.add(bucket["subject"])
+    if single and not both:
+        return "unpaired"
+    if both and not single:
+        return "within"
+    if not both and not single:
+        return "within"
+    raise ValueError("human_design=auto cannot decide: some subjects answered both conditions of a pair and others a single one; choose --human-design within or unpaired explicitly")
+
+
+def _human_sets(buckets, design, label, exclusions, subjects=None):
+    selected = [bucket for bucket in buckets if subjects is None or bucket["subject"] in subjects]
+    if design == "unpaired":
+        return _unpaired_sets(selected, label, exclusions)
+    return _contrast_sets(selected, [PRIMARY_CONTRAST], label, exclusions)
+
+
+def _coverage(prepared, sets, contrasts, unpaired=False):
     rows = []
-    for group in sorted(groups, key=_canonical):
-        pairs = groups[group]
-        for metric in METRICS:
-            values = _cluster_values(pairs, metric)
-            effect, low, high = _estimate(values, bootstrap, _rng(seed, [source, group, metric]))
-            rows.append({**_group_row(group), "source": source, "metric": metric,
-                         "unit": UNITS[metric], "contrast": "event_minus_neutral",
-                         "estimate": effect, "ci_low": low, "ci_high": high,
-                         "n_pairs": len(pairs), "n_clusters": len(values),
-                         "n_subjects": len({p["subject"] for p in pairs if p["subject"] is not None}),
-                         "ci_method": "scenario_cluster_percentile" if low is not None else "unavailable",
-                         "ci_unavailable_reason": "" if low is not None else ("bootstrap_disabled" if not bootstrap else "fewer_than_two_clusters")})
+    for group in sorted(prepared["seen"], key=_canonical):
+        keys = prepared["seen"][group]
+        observed = len({pair_id for _subject, pair_id in keys}) if unpaired else len(keys)
+        for name in contrasts:
+            complete = sets["complete"][name].get(group, [])
+            attempted = sets["attempted"][name].get(group, [])
+            rows.append({**_group_row(group), "source": prepared["label"], "contrast": name,
+                         "observed_pairs": observed, "attempted_pairs": len(attempted),
+                         "complete_pairs": len(complete), "excluded_pairs": observed - len(complete),
+                         "complete_pair_coverage": len(complete) / observed if observed else None,
+                         "n_clusters": len({pair["cluster"] for pair in complete})})
     return rows
 
 
-def _task_key(pair):
-    return (pair["subject"], *(pair["event"].get(field)
-                              for field in (*TASK_FIELDS, *OPTIONAL_TASK_FIELDS)))
+# ---------------------------------------------------------------------------
+# Estimators
+# ---------------------------------------------------------------------------
+
+def _effect_row(group, source, contrast, metric, stats, pairs, n_clusters, bootstrap):
+    estimate, low, high, p_value = stats
+    return {**_group_row(group), "source": source, "metric": metric, "unit": UNITS[metric],
+            "contrast": contrast, "estimate": estimate, "ci_low": low, "ci_high": high,
+            "n_pairs": len(pairs), "n_clusters": n_clusters,
+            "n_subjects": len({subject for pair in pairs for subject in pair["subjects"]}),
+            "ci_method": "scenario_cluster_percentile" if low is not None else "unavailable",
+            "ci_unavailable_reason": _ci_reason(low, bootstrap),
+            **{**_inference_blank(metric), "p_value": p_value}}
 
 
-def _interactions(groups, bootstrap, seed, source, exclusions):
+def _effects(prepared, sets, contrasts, bootstrap, seed):
+    source = prepared["label"]
     rows = []
-    for group in sorted(groups, key=_canonical):
-        if group[4] == "en":
-            continue
-        english = (*group[:4], "en", *group[5:])
-        if english not in groups:
-            continue
-        left, right = defaultdict(list), defaultdict(list)
-        for pair in groups[group]:
-            left[_task_key(pair)].append(pair)
-        for pair in groups[english]:
-            right[_task_key(pair)].append(pair)
-        matched = []
-        ambiguous = 0
-        for key in sorted(left.keys() & right.keys(), key=_canonical):
-            if len(left[key]) != 1 or len(right[key]) != 1:
-                ambiguous += 1
-                exclusions.append({"source": source, "record_index": "",
-                                   "pair_id": ",".join(p["pair_id"] for p in left[key] + right[key]),
-                                   "reason": "ambiguous_language_task_match"})
+    for group in sorted(prepared["seen"], key=_canonical):
+        for contrast in contrasts:
+            pairs = sets["complete"][contrast].get(group, [])
+            values = {metric: _cluster_values(pairs, metric) for metric in METRICS}
+            stats = _estimate_all(values, bootstrap, _rng(seed, [source, contrast, group]))
+            rows.extend(_effect_row(group, source, contrast, metric, stats[metric], pairs,
+                                    len(values[metric]), bootstrap) for metric in METRICS)
+    return rows
+
+
+def _interactions(prepared, sets, contrasts, bootstrap, seed, exclusions):
+    source = prepared["label"]
+    tables = {spec[3]: [] for spec in INTERACTIONS}
+    for field, label, reference, table in INTERACTIONS:
+        index = GROUP_FIELDS.index(field)
+        omit = field if field in TASK_FIELDS else None
+        for contrast in contrasts:
+            groups = sets["complete"][contrast]
+            for group in sorted(prepared["seen"], key=_canonical):
+                if group[index] == reference:
+                    continue
+                base = (*group[:index], reference, *group[index + 1:])
+                if base not in prepared["seen"]:
+                    continue
+                left, right = defaultdict(list), defaultdict(list)
+                for pair in groups.get(group, []):
+                    left[_task_key(pair, omit)].append(pair)
+                for pair in groups.get(base, []):
+                    right[_task_key(pair, omit)].append(pair)
+                matched = []
+                ambiguous = 0
+                for key in sorted(left.keys() & right.keys(), key=_canonical):
+                    if len(left[key]) != 1 or len(right[key]) != 1:
+                        ambiguous += 1
+                        exclusions.append({"source": source, "record_index": "", "contrast": contrast,
+                                           "pair_id": ",".join(p["pair_id"] for p in left[key] + right[key]),
+                                           "reason": f"ambiguous_{label}_task_match", "detail": ""})
+                        continue
+                    target, baseline = left[key][0], right[key][0]
+                    matched.append({**target, "diff": {m: target["diff"][m] - baseline["diff"][m] for m in METRICS}})
+                values = {metric: _cluster_values(matched, metric) for metric in METRICS}
+                stats = _estimate_all(values, bootstrap, _rng(seed, ["interaction", source, label, contrast, group]))
+                for metric in METRICS:
+                    estimate, low, high, p_value = stats[metric]
+                    tables[table].append({
+                        **_group_row(group), "source": source, "dimension": label,
+                        "reference_level": reference, "level": group[index], "metric": metric,
+                        "unit": UNITS[metric], "contrast": contrast,
+                        "interaction": f"{label}_effect_minus_reference_{label}_effect",
+                        "estimate": estimate, "ci_low": low, "ci_high": high,
+                        "matched_pairs": len(matched), "n_clusters": len(values[metric]),
+                        "unmatched_tasks": len(left.keys() - right.keys()),
+                        "unmatched_reference_tasks": len(right.keys() - left.keys()),
+                        "ambiguous_task_matches": ambiguous,
+                        "ci_method": "paired_scenario_cluster_percentile" if low is not None else "unavailable",
+                        "ci_unavailable_reason": _ci_reason(low, bootstrap),
+                        **{**_inference_blank(metric), "p_value": p_value}})
+    return tables
+
+
+def _scenario_tables(prepared, sets, contrasts):
+    """Per-scenario contrast estimates plus a cross-scenario robustness summary."""
+    source = prepared["label"]
+    effect_rows, summary_rows = [], []
+    for group in sorted(prepared["seen"], key=_canonical):
+        for contrast in contrasts:
+            pairs = sets["complete"][contrast].get(group, [])
+            if not pairs:
                 continue
-            target, baseline = left[key][0], right[key][0]
-            matched.append({**target, "diff": {m: target["diff"][m] - baseline["diff"][m] for m in METRICS}})
-        for metric in METRICS:
-            values = _cluster_values(matched, metric)
-            effect, low, high = _estimate(values, bootstrap, _rng(seed, ["interaction", source, group, metric]))
-            rows.append({**_group_row(group), "source": source, "reference_language": "en",
-                         "metric": metric, "unit": UNITS[metric],
-                         "contrast": "language_event_effect_minus_english_event_effect",
-                         "estimate": effect, "ci_low": low, "ci_high": high,
-                         "matched_pairs": len(matched), "n_clusters": len(values),
-                         "unmatched_language_tasks": len(left.keys() - right.keys()),
-                         "unmatched_english_tasks": len(right.keys() - left.keys()),
-                         "ambiguous_task_matches": ambiguous,
-                         "ci_method": "paired_scenario_cluster_percentile" if low is not None else "unavailable"})
+            by_cluster = defaultdict(list)
+            for pair in pairs:
+                by_cluster[pair["cluster"]].append(pair)
+            for metric in METRICS:
+                values = _cluster_values(pairs, metric)
+                for cluster in sorted(values):
+                    effect_rows.append({**_group_row(group), "source": source, "metric": metric,
+                                        "unit": UNITS[metric], "contrast": contrast, "cluster_id": cluster,
+                                        "estimate": values[cluster], "n_pairs": len(by_cluster[cluster])})
+                pooled = fmean(values.values())
+                signs = [(v > 0) - (v < 0) for v in values.values()]
+                pooled_sign = (pooled > 0) - (pooled < 0)
+                summary_rows.append({**_group_row(group), "source": source, "metric": metric,
+                                     "unit": UNITS[metric], "contrast": contrast,
+                                     "n_scenarios": len(values), "pooled_estimate": pooled,
+                                     "share_same_sign": sum(1 for s in signs if s == pooled_sign) / len(signs),
+                                     "min_scenario_estimate": min(values.values()),
+                                     "max_scenario_estimate": max(values.values())})
+    return effect_rows, summary_rows
+
+
+def _template_effects(prepared, sets, contrasts, bootstrap, seed):
+    source = prepared["label"]
+    templates = {item["trial"]["template_id"] for item in prepared["candidates"]}
+    if len(templates) < 2:
+        return []
+    rows = []
+    for group in sorted(prepared["seen"], key=_canonical):
+        for contrast in contrasts:
+            pairs = sets["complete"][contrast].get(group, [])
+            for template in sorted(templates):
+                subset = [pair for pair in pairs if pair["a"]["template_id"] == template]
+                values = {metric: _cluster_values(subset, metric) for metric in METRICS}
+                stats = _estimate_all(values, bootstrap, _rng(seed, ["template", source, contrast, group, template]))
+                for metric in METRICS:
+                    estimate, low, high, _p = stats[metric]
+                    rows.append({**_group_row(group), "source": source, "template_id": template,
+                                 "metric": metric, "unit": UNITS[metric], "contrast": contrast,
+                                 "estimate": estimate, "ci_low": low, "ci_high": high,
+                                 "n_pairs": len(subset), "n_clusters": len(values[metric]),
+                                 "ci_method": "scenario_cluster_percentile" if low is not None else "unavailable",
+                                 "ci_unavailable_reason": _ci_reason(low, bootstrap)})
+    return rows
+
+
+def _validity_rows(prepared, sets, contrasts, bootstrap, seed, contrast_effects=True):
+    source = prepared["label"]
+    rows = []
+    tallies = defaultdict(Counter)
+    for item in prepared["candidates"]:
+        group = item["group"]
+        status = item["result"]["status"]
+        levels = {"all": "all", "condition": item["trial"]["condition"]}
+        for name, index in VALIDITY_DIMENSIONS:
+            if isinstance(index, int):
+                levels[name] = group[index]
+        for dimension, level in levels.items():
+            tallies[(group[:4], dimension, level)][status] += 1
+    for (identity, dimension, level), counts in sorted(tallies.items(), key=lambda entry: _canonical(entry[0])):
+        total = sum(counts.values())
+        rows.append({**dict(zip(GROUP_FIELDS[:4], identity)), "source": source, "row_type": "valid_rate",
+                     "dimension": dimension, "level": level, "n_records": total,
+                     **{f"n_{status}": counts[status] for status in STATUSES},
+                     "valid_rate": counts["ok"] / total if total else None})
+    if not contrast_effects:
+        return rows
+    for group in sorted(prepared["seen"], key=_canonical):
+        for contrast in contrasts:
+            attempted = sets["attempted"][contrast].get(group, [])
+            pairs = [{**pair, "diff": {"valid": float(pair["a"]["metrics"] is not None) -
+                                       float(pair["b"]["metrics"] is not None)}} for pair in attempted]
+            values = {"valid": _cluster_values(pairs, "valid")}
+            estimate, low, high, _p = _estimate_all(values, bootstrap, _rng(seed, ["validity", source, contrast, group]))["valid"]
+            rows.append({**_group_row(group), "source": source, "row_type": "contrast_difference",
+                         "contrast": contrast, "estimate": estimate, "ci_low": low, "ci_high": high,
+                         "n_pairs": len(pairs), "n_clusters": len(values["valid"]),
+                         "ci_method": "scenario_cluster_percentile" if low is not None else "unavailable",
+                         "ci_unavailable_reason": _ci_reason(low, bootstrap)})
+    return rows
+
+
+def _side_bounds(item, metric, economics):
+    if item["metrics"] is not None:
+        value = item["metrics"][metric]
+        return value, value
+    if metric == "timing_days":
+        return 0.0, float(economics["max_delay_days"])
+    if metric == "reserve_shortfall_pct":
+        return 0.0, max(100.0, 100.0 * economics["liquidity_need_inr"] / economics["capital_inr"])
+    return BOUNDED[metric]
+
+
+def _bounds_rows(prepared, sets, contrasts):
+    """Worst-case (Manski-type) bounds on cluster-averaged contrasts over all attempted pairs."""
+    source = prepared["label"]
+    bounded = ("gold_pct", "equity_pct", "cash_pct", "buy_now", "timing_days",
+               "reserve_shortfall_pct", "reserve_violation")
+    rows = []
+    for group in sorted(prepared["seen"], key=_canonical):
+        for contrast in contrasts:
+            attempted = sets["attempted"][contrast].get(group, [])
+            complete = sets["complete"][contrast].get(group, [])
+            lows, highs = [], []
+            for pair in attempted:
+                economics = pair["a"]["trial"]["economics"]
+                low, high = {}, {}
+                for metric in bounded:
+                    a_low, a_high = _side_bounds(pair["a"], metric, economics)
+                    b_low, b_high = _side_bounds(pair["b"], metric, economics)
+                    low[metric], high[metric] = a_low - b_high, a_high - b_low
+                lows.append({**pair, "diff_low": low})
+                highs.append({**pair, "diff_high": high})
+            share = (len(attempted) - len(complete)) / len(attempted) if attempted else None
+            for metric in METRICS:
+                row = {**_group_row(group), "source": source, "metric": metric, "unit": UNITS[metric],
+                       "contrast": contrast, "n_pairs_attempted": len(attempted),
+                       "n_pairs_complete": len(complete), "share_missing_one_side": share,
+                       "estimate_complete_case": (fmean(_cluster_values(complete, metric).values())
+                                                  if complete else None),
+                       "bound_low": None, "bound_high": None, "bounds_exclude_zero": None,
+                       "n_clusters_attempted": 0,
+                       "skipped_reason": "" if metric in bounded else "unbounded_metric"}
+                if metric in bounded and attempted:
+                    low_values = _cluster_values(lows, metric, "diff_low")
+                    high_values = _cluster_values(highs, metric, "diff_high")
+                    row["bound_low"] = fmean(low_values.values())
+                    row["bound_high"] = fmean(high_values.values())
+                    row["bounds_exclude_zero"] = row["bound_low"] > 0 or row["bound_high"] < 0
+                    row["n_clusters_attempted"] = len(low_values)
+                rows.append(row)
     return rows
 
 
@@ -356,89 +753,521 @@ def _same_task(left, right):
                (*PAIR_FIELDS, *OPTIONAL_TASK_FIELDS, "pair_id", "trial_id", "condition", "prompt_sha256", "prompt"))
 
 
-def _human_comparisons(models, humans, bootstrap, seed, exclusions):
-    rows = []
+def _comparison_row(group, design, estimate, low, high, draws, bootstrap, matched_model, matched_units,
+                    clusters, subjects, metric, unmatched):
+    return {**_group_row(group), "metric": metric, "unit": UNITS[metric],
+            "contrast": "model_event_effect_minus_human_event_effect", "human_design": design,
+            "estimate": estimate, "ci_low": low, "ci_high": high,
+            "matched_model_pairs": matched_model, "matched_human_units": matched_units,
+            "n_clusters": clusters, "n_subjects": subjects, "bootstrap_valid_draws": draws,
+            "ci_method": ("crossed_subject_scenario_percentile" if design == "within" else
+                          "stratified_subject_scenario_percentile") if low is not None else "unavailable",
+            "ci_unavailable_reason": "" if low is not None else ("bootstrap_disabled" if not bootstrap else "requires_two_subjects_and_two_clusters"),
+            "unmatched_model_pairs": unmatched}
+
+
+def _human_comparisons(models, humans, design, bootstrap, seed, exclusions):
+    """model_event_effect - human_event_effect on identical trials (event_minus_neutral only)."""
     human_index = defaultdict(list)
     for pairs in humans.values():
         for pair in pairs:
-            human_index[(pair["event"]["trial_id"], pair["neutral"]["trial_id"])].append(pair)
+            human_index[(pair["a"]["trial_id"], pair["b"]["trial_id"])].append(pair)
+    rows = []
     for group in sorted(models, key=_canonical):
         matches = []
         matched_model_pairs = set()
         for model in models[group]:
-            ids = (model["event"]["trial_id"], model["neutral"]["trial_id"])
+            ids = (model["a"]["trial_id"], model["b"]["trial_id"])
             for human in human_index.get(ids, []):
-                if not (_same_task(model["event"], human["event"]) and
-                        _same_task(model["neutral"], human["neutral"])):
-                    exclusions.append({"source": "comparison", "record_index": "",
-                                       "pair_id": model["pair_id"], "reason": "human_task_metadata_mismatch"})
+                if not (_same_task(model["a"], human["a"]) and _same_task(model["b"], human["b"])):
+                    exclusions.append({"source": "comparison", "record_index": "", "contrast": PRIMARY_CONTRAST,
+                                       "pair_id": model["pair_id"], "reason": "human_task_metadata_mismatch", "detail": ""})
                     continue
                 matched_model_pairs.add(ids)
-                matches.append({**human, "diff": {m: model["diff"][m] - human["diff"][m] for m in METRICS}})
-        for metric in METRICS:
-            cells = defaultdict(list)
-            for pair in matches:
-                cells[(pair["cluster"], pair["subject"])].append(pair["diff"][metric])
-            cells = {key: fmean(values) for key, values in cells.items()}
-            clusters = sorted({key[0] for key in cells})
-            subjects = sorted({key[1] for key in cells})
-            estimate_values = _cluster_values(matches, metric)
-            estimate = fmean(estimate_values.values()) if estimate_values else None
-            draws = []
-            if len(clusters) >= 2 and len(subjects) >= 2 and bootstrap:
-                rng = _rng(seed, ["human", group, metric])
-                for _ in range(bootstrap):
-                    cluster_counts = Counter(rng.choices(clusters, k=len(clusters)))
-                    subject_counts = Counter(rng.choices(subjects, k=len(subjects)))
-                    sampled = []
-                    for cluster, cluster_weight in cluster_counts.items():
-                        observed = [(value, subject_counts[subject]) for (c, subject), value in cells.items()
-                                    if c == cluster and subject_counts[subject]]
-                        denominator = sum(weight for _, weight in observed)
-                        if denominator:
-                            mean = sum(value * weight for value, weight in observed) / denominator
-                            sampled.extend([mean] * cluster_weight)
-                    if sampled:
-                        draws.append(fmean(sampled))
-            low, high = _interval(draws)
-            rows.append({**_group_row(group), "metric": metric, "unit": UNITS[metric],
-                         "contrast": "model_event_effect_minus_human_event_effect",
-                         "estimate": estimate, "ci_low": low, "ci_high": high,
-                         "matched_model_pairs": len(matched_model_pairs),
-                         "matched_subject_pairs": len(matches), "n_clusters": len(clusters),
-                         "n_subjects": len(subjects), "bootstrap_valid_draws": len(draws),
-                         "ci_method": "crossed_subject_scenario_percentile" if low is not None else "unavailable",
-                         "ci_unavailable_reason": "" if low is not None else ("bootstrap_disabled" if not bootstrap else "requires_two_subjects_and_two_clusters"),
-                         "unmatched_model_pairs": len(models[group]) - len(matched_model_pairs)})
+                matches.append((model, human))
+        unmatched = len(models[group]) - len(matched_model_pairs)
+        if design == "unpaired":
+            rows.extend(_comparison_unpaired(group, matches, matched_model_pairs, unmatched, bootstrap, seed))
+        else:
+            rows.extend(_comparison_within(group, matches, matched_model_pairs, unmatched, bootstrap, seed))
     return rows
 
 
-def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=None):
-    """Write complete-case effects, matched interactions, and explicit exclusions.
+def _comparison_within(group, matches, matched_model_pairs, unmatched, bootstrap, seed):
+    pairs = [{**human, "diff": {m: model["diff"][m] - human["diff"][m] for m in METRICS}}
+             for model, human in matches]
+    rows = []
+    for metric in METRICS:
+        cells = defaultdict(list)
+        for pair in pairs:
+            cells[(pair["cluster"], pair["subject"])].append(pair["diff"][metric])
+        cells = {key: fmean(values) for key, values in cells.items()}
+        clusters = sorted({key[0] for key in cells})
+        subjects = sorted({key[1] for key in cells})
+        values = _cluster_values(pairs, metric)
+        estimate = fmean(values.values()) if values else None
+        draws = []
+        if len(clusters) >= 2 and len(subjects) >= 2 and bootstrap:
+            rng = _rng(seed, ["human", group, metric])
+            for _ in range(bootstrap):
+                cluster_counts = Counter(rng.choices(clusters, k=len(clusters)))
+                subject_counts = Counter(rng.choices(subjects, k=len(subjects)))
+                sampled = []
+                for cluster, cluster_weight in cluster_counts.items():
+                    observed = [(value, subject_counts[subject]) for (c, subject), value in cells.items()
+                                if c == cluster and subject_counts[subject]]
+                    denominator = sum(weight for _, weight in observed)
+                    if denominator:
+                        mean = sum(value * weight for value, weight in observed) / denominator
+                        sampled.extend([mean] * cluster_weight)
+                if sampled:
+                    draws.append(fmean(sampled))
+        low, high = _interval(draws)
+        rows.append(_comparison_row(group, "within", estimate, low, high, len(draws), bootstrap,
+                                    len(matched_model_pairs), len(pairs), len(clusters), len(subjects),
+                                    metric, unmatched))
+    return rows
 
-    CIs are unadjusted 95% percentile intervals. Coverage denominators describe
+
+def _comparison_unpaired(group, matches, matched_model_pairs, unmatched, bootstrap, seed):
+    pairs = [{"cluster": human["cluster"], "subject": None, "model": model["diff"],
+              "event": human["event_resp"], "neutral": human["neutral_resp"],
+              "diff": {m: model["diff"][m] - human["diff"][m] for m in METRICS}}
+             for model, human in matches]
+    by_cluster = defaultdict(list)
+    for pair in pairs:
+        by_cluster[pair["cluster"]].append(pair)
+    clusters = sorted(by_cluster)
+    arms = defaultdict(set)
+    for pair in pairs:
+        for arm in ("event", "neutral"):
+            for subject, _metrics_ in pair[arm]:
+                arms[subject].add(arm)
+    # Subjects are resampled within strata defined by which arm(s) they appeared in,
+    # so a between-subject design keeps arm sizes fixed and a counterbalanced subject
+    # who answered different clusters in both arms stays one dependent unit.
+    strata = defaultdict(list)
+    for subject in sorted(arms):
+        strata[tuple(sorted(arms[subject]))].append(subject)
+    estimates = {metric: _cluster_values(pairs, metric) for metric in METRICS}
+    draws = {metric: [] for metric in METRICS}
+    valid = 0
+    if len(clusters) >= 2 and len(arms) >= 2 and bootstrap:
+        rng = _rng(seed, ["human-unpaired", group])
+        for _ in range(bootstrap):
+            cluster_counts = Counter(rng.choices(clusters, k=len(clusters)))
+            weights = Counter()
+            for key in sorted(strata):
+                weights.update(rng.choices(strata[key], k=len(strata[key])))
+            sampled = {metric: [] for metric in METRICS}
+            for cluster in sorted(cluster_counts):
+                surviving = {metric: [] for metric in METRICS}
+                for pair in by_cluster[cluster]:
+                    event_weight = sum(weights[s] for s, _ in pair["event"])
+                    neutral_weight = sum(weights[s] for s, _ in pair["neutral"])
+                    if not event_weight or not neutral_weight:
+                        continue
+                    for metric in METRICS:
+                        human = (sum(weights[s] * m[metric] for s, m in pair["event"]) / event_weight -
+                                 sum(weights[s] * m[metric] for s, m in pair["neutral"]) / neutral_weight)
+                        surviving[metric].append(pair["model"][metric] - human)
+                if surviving[METRICS[0]]:
+                    for metric in METRICS:
+                        sampled[metric].extend([fmean(surviving[metric])] * cluster_counts[cluster])
+            if sampled[METRICS[0]]:
+                valid += 1
+                for metric in METRICS:
+                    draws[metric].append(fmean(sampled[metric]))
+    rows = []
+    for metric in METRICS:
+        low, high = _interval(draws[metric])
+        estimate = fmean(estimates[metric].values()) if estimates[metric] else None
+        rows.append(_comparison_row(group, "unpaired", estimate, low, high, valid, bootstrap,
+                                    len(matched_model_pairs), len(pairs), len(clusters), len(arms),
+                                    metric, unmatched))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Preregistration and multiplicity
+# ---------------------------------------------------------------------------
+
+def _load_prereg(path):
+    raw = Path(path).read_bytes()
+    sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        data = strict_json(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path}: invalid preregistration JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: preregistration must be a JSON object")
+    unknown = set(data) - PREREG_KEYS
+    if unknown:
+        raise ValueError(f"{path}: unknown preregistration keys: {sorted(unknown)}")
+    if data.get("schema_version") != 1:
+        raise ValueError(f"{path}: schema_version must be 1")
+    if "_note" in data and not isinstance(data["_note"], str):
+        raise ValueError(f"{path}: _note must be text")
+    primary = data.get("primary")
+    if not isinstance(primary, list) or not primary:
+        raise ValueError(f"{path}: primary must be a nonempty list")
+    if data.get("primary_adjustment", "holm") != "holm":
+        raise ValueError(f"{path}: primary_adjustment must be 'holm'")
+    exploratory = data.get("exploratory_adjustment", "benjamini_hochberg")
+    if exploratory not in EXPLORATORY_ADJUSTMENTS:
+        raise ValueError(f"{path}: exploratory_adjustment must be one of {EXPLORATORY_ADJUSTMENTS}")
+    entries, ids = [], set()
+    for number, entry in enumerate(primary, 1):
+        where = f"{path}: primary[{number}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be an object")
+        extra = set(entry) - PREREG_ENTRY_KEYS
+        if extra:
+            raise ValueError(f"{where}: unknown keys {sorted(extra)}")
+        absent = PREREG_ENTRY_KEYS - {"filters"} - set(entry)
+        if absent:
+            raise ValueError(f"{where}: missing keys {sorted(absent)}")
+        if not isinstance(entry["id"], str) or not entry["id"] or entry["id"] in ids:
+            raise ValueError(f"{where}: id must be a unique nonempty string")
+        ids.add(entry["id"])
+        if entry["table"] not in FAMILY_TABLES:
+            raise ValueError(f"{where}: table must be one of {FAMILY_TABLES}")
+        if entry["metric"] not in METRICS:
+            raise ValueError(f"{where}: unknown metric {entry['metric']!r}")
+        if entry["metric"] in DERIVED_FROM_ALLOCATION:
+            raise ValueError(f"{where}: {entry['metric']} is derived from the allocation and cannot be primary")
+        if entry["contrast"] not in CONTRASTS:
+            raise ValueError(f"{where}: contrast must be one of {tuple(CONTRASTS)}")
+        mme = entry["minimum_meaningful_effect"]
+        if isinstance(mme, bool) or not isinstance(mme, (int, float)) or not math.isfinite(mme) or mme <= 0:
+            raise ValueError(f"{where}: minimum_meaningful_effect must be a positive finite number")
+        filters = entry.get("filters", {})
+        if not isinstance(filters, dict):
+            raise ValueError(f"{where}: filters must be an object")
+        for key, value in filters.items():
+            if key not in PREREG_FILTER_KEYS:
+                raise ValueError(f"{where}: unknown filter {key!r}; allowed: {PREREG_FILTER_KEYS}")
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{where}: filter {key!r} must be a nonempty string")
+        entries.append({"id": entry["id"], "table": entry["table"], "metric": entry["metric"],
+                        "contrast": entry["contrast"], "filters": dict(filters),
+                        "minimum_meaningful_effect": float(mme)})
+    return {"sha256": sha256, "path": str(path), "primary": entries,
+            "primary_adjustment": "holm", "exploratory_adjustment": exploratory}
+
+
+def _holm(p_values):
+    order = sorted(range(len(p_values)), key=lambda i: (p_values[i], i))
+    adjusted, running = [None] * len(p_values), 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (len(p_values) - rank) * p_values[i]))
+        adjusted[i] = running
+    return adjusted
+
+
+def _benjamini_hochberg(p_values):
+    m = len(p_values)
+    order = sorted(range(m), key=lambda i: (p_values[i], i), reverse=True)
+    adjusted, running = [None] * m, 1.0
+    for k, i in enumerate(order):
+        running = min(running, p_values[i] * m / (m - k))
+        adjusted[i] = min(1.0, running)
+    return adjusted
+
+
+def _adjust_family(rows, method, family):
+    tested = [row for row in rows if row["p_value"] is not None]
+    adjusters = {"holm": _holm, "benjamini_hochberg": _benjamini_hochberg,
+                 "none": lambda values: list(values)}
+    adjusted = adjusters[method]([row["p_value"] for row in tested])
+    for row, value in zip(tested, adjusted):
+        row["p_adjusted"] = value
+    for row in rows:
+        row["family"] = family
+        row["adjustment"] = method
+        row["n_family"] = len(tested)
+    return len(tested)
+
+
+def _apply_multiplicity(tables, prereg):
+    entries = prereg["primary"] if prereg else []
+    matched = {entry["id"]: [] for entry in entries}
+    primary, exploratory = [], []
+    for name in FAMILY_TABLES:
+        for row in tables[name]:
+            if row["metric"] in DERIVED_FROM_ALLOCATION:
+                row.update(family="derived_from_allocation", adjustment="none")
+                continue
+            hits = [entry for entry in entries if entry["table"] == name and
+                    entry["metric"] == row["metric"] and entry["contrast"] == row["contrast"] and
+                    all(str(row.get(key)) == value for key, value in entry["filters"].items())]
+            if len(hits) > 1:
+                raise ValueError(f"Row {name}/{row['metric']}/{row['contrast']} matches several primary entries: "
+                                 f"{[hit['id'] for hit in hits]}; make primary filters disjoint")
+            if hits:
+                entry = hits[0]
+                row["primary_id"] = entry["id"]
+                row["minimum_meaningful_effect"] = entry["minimum_meaningful_effect"]
+                low, high, mme = row["ci_low"], row["ci_high"], entry["minimum_meaningful_effect"]
+                if low is not None:
+                    row["exceeds_mme"] = low > mme or high < -mme
+                    row["within_mme"] = low >= -mme and high <= mme
+                matched[entry["id"]].append(row)
+                primary.append(row)
+            else:
+                exploratory.append(row)
+    n_primary = _adjust_family(primary, "holm", "primary")
+    method = prereg["exploratory_adjustment"] if prereg else "benjamini_hochberg"
+    n_exploratory = _adjust_family(exploratory, method, "exploratory")
+    summary = {
+        "provided": prereg is not None,
+        "sha256": prereg["sha256"] if prereg else None,
+        "path": prereg["path"] if prereg else None,
+        "primary_adjustment": "holm", "exploratory_adjustment": method,
+        "entries": [{**entry, "n_rows_matched": len(matched[entry["id"]]),
+                     "n_tests_with_p_value": sum(1 for row in matched[entry["id"]] if row["p_value"] is not None)}
+                    for entry in entries],
+        "unmatched_primary": [entry["id"] for entry in entries if not matched[entry["id"]]],
+        "n_primary_tests": n_primary, "n_exploratory_tests": n_exploratory,
+        "n_derived_from_allocation_excluded": sum(
+            1 for name in FAMILY_TABLES for row in tables[name] if row["metric"] in DERIVED_FROM_ALLOCATION),
+    }
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Participant covariates and human heterogeneity
+# ---------------------------------------------------------------------------
+
+def _check_participant(entry, where):
+    if not isinstance(entry, dict) or set(entry) != {*PARTICIPANT_REQUIRED, *PARTICIPANT_OPTIONAL}:
+        raise ValueError(f"{where}: participant must have exactly the fields {[*PARTICIPANT_REQUIRED, *PARTICIPANT_OPTIONAL]}")
+    if not isinstance(entry["subject_id"], str) or not entry["subject_id"].strip() or entry["subject_id"] != entry["subject_id"].strip():
+        raise ValueError(f"{where}: subject_id must be a nonempty trimmed string")
+    if entry["survey_language"] not in PARTICIPANT_LANGUAGES:
+        raise ValueError(f"{where}: survey_language must be one of {PARTICIPANT_LANGUAGES}")
+    for field in ("language_proficiency", "observance_self_report"):
+        value = entry[field]
+        if type(value) is not int or not 1 <= value <= 5:
+            raise ValueError(f"{where}: {field} must be an integer 1-5")
+    literacy = entry["financial_literacy"]
+    if isinstance(literacy, bool) or not isinstance(literacy, (int, float)) or not math.isfinite(literacy):
+        raise ValueError(f"{where}: financial_literacy must be a finite number")
+    for field in PARTICIPANT_OPTIONAL:
+        if entry[field] is not None and (not isinstance(entry[field], str) or not entry[field].strip()):
+            raise ValueError(f"{where}: {field} must be null or nonempty text")
+
+
+def _participant_from_row(row, where):
+    entry = {field: row[field].strip() for field in PARTICIPANT_REQUIRED}
+    for field in ("language_proficiency", "observance_self_report"):
+        if not re.fullmatch(r"[0-9]+", entry[field]):
+            raise ValueError(f"{where}: {field} must be an integer 1-5, got {entry[field]!r}")
+        entry[field] = int(entry[field])
+    try:
+        entry["financial_literacy"] = float(entry["financial_literacy"])
+    except ValueError:
+        raise ValueError(f"{where}: financial_literacy must be a number, got {entry['financial_literacy']!r}") from None
+    for field in PARTICIPANT_OPTIONAL:
+        text = (row.get(field) or "").strip()
+        entry[field] = text or None
+    _check_participant(entry, where)
+    return entry
+
+
+def import_participants(csv_path, output_path):
+    """Strictly import self-reported participant covariates; nothing is imputed.
+
+    Required columns: subject_id, survey_language (en|hi|ta|gu|bn),
+    language_proficiency (integer 1-5, self-rated in the survey language),
+    financial_literacy (numeric score from the researcher's own instrument; its
+    scale and validity are not checked here), observance_self_report (integer 1-5,
+    personal observance of auspicious calendar periods). Optional: age_band, region.
+    Unknown columns, blank required cells and duplicate subject_ids are errors.
+    A header-only file is valid.
+    """
+    participants = []
+    seen = set()
+    for line, row in _csv_read(csv_path, PARTICIPANT_REQUIRED,
+                               allowed=(*PARTICIPANT_REQUIRED, *PARTICIPANT_OPTIONAL)):
+        entry = _participant_from_row(row, f"{csv_path}:{line}")
+        if entry["subject_id"] in seen:
+            raise ValueError(f"{csv_path}:{line}: duplicate subject_id {entry['subject_id']!r}")
+        seen.add(entry["subject_id"])
+        participants.append(entry)
+    by_language = Counter(entry["survey_language"] for entry in participants)
+    document = {"schema_version": 1, "n_participants": len(participants), "participants": participants,
+                "notes": "Self-reported covariates. financial_literacy is a researcher-defined numeric score; instrument and scale are not validated here. Used for descriptive heterogeneity only, never to adjust the model-human comparison."}
+    _json_write(output_path, document)
+    return {"participants": len(participants), "by_survey_language": dict(sorted(by_language.items())),
+            "output": str(output_path), "warnings": []}
+
+
+def _load_participants(path):
+    try:
+        document = strict_json(Path(path).read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid participants JSON: {exc}") from exc
+    if not isinstance(document, dict) or document.get("schema_version") != 1 or \
+            not isinstance(document.get("participants"), list):
+        raise ValueError(f"{path}: expected an import_participants output (schema_version 1)")
+    seen = set()
+    for number, entry in enumerate(document["participants"], 1):
+        _check_participant(entry, f"{path}: participants[{number}]")
+        if entry["subject_id"] in seen:
+            raise ValueError(f"{path}: duplicate subject_id {entry['subject_id']!r}")
+        seen.add(entry["subject_id"])
+    return document["participants"]
+
+
+def _describe(values):
+    return (fmean(values), min(values), max(values)) if values else (None, None, None)
+
+
+def _participant_tables(participants, observed_subjects):
+    by_language = defaultdict(list)
+    for entry in participants:
+        by_language["all"].append(entry)
+        by_language[entry["survey_language"]].append(entry)
+    rows = []
+    for language in ("all", *PARTICIPANT_LANGUAGES):
+        group = by_language.get(language, [])
+        if not group and language != "all":
+            continue
+        proficiency = _describe([e["language_proficiency"] for e in group])
+        literacy_values = [e["financial_literacy"] for e in group]
+        literacy = _describe(literacy_values)
+        observance = _describe([e["observance_self_report"] for e in group])
+        rows.append({
+            "survey_language": language, "n_participants": len(group),
+            "n_with_responses": sum(1 for e in group if e["subject_id"] in observed_subjects),
+            "language_proficiency_mean": proficiency[0], "language_proficiency_min": proficiency[1],
+            "language_proficiency_max": proficiency[2], "financial_literacy_mean": literacy[0],
+            "financial_literacy_median": median(literacy_values) if literacy_values else None,
+            "financial_literacy_min": literacy[1], "financial_literacy_max": literacy[2],
+            "observance_mean": observance[0],
+            "observance_high_n": sum(1 for e in group if e["observance_self_report"] >= 4),
+            "observance_middle_n": sum(1 for e in group if e["observance_self_report"] == 3),
+            "observance_low_n": sum(1 for e in group if e["observance_self_report"] <= 2)})
+    return rows
+
+
+def _heterogeneity(buckets, design, participants, bootstrap, seed, exclusions):
+    by_id = {entry["subject_id"]: entry for entry in participants}
+    observed = sorted({bucket["subject"] for bucket in buckets if bucket["subject"] is not None})
+    for subject in observed:
+        if subject not in by_id:
+            exclusions.append({"source": "participants", "record_index": "", "pair_id": "", "contrast": "",
+                               "reason": "subject_missing_from_participants_file", "detail": subject})
+    known = [subject for subject in observed if subject in by_id]
+    high = {s for s in known if by_id[s]["observance_self_report"] >= 4}
+    low = {s for s in known if by_id[s]["observance_self_report"] <= 2}
+    middle = len(known) - len(high) - len(low)
+    literacy = [by_id[s]["financial_literacy"] for s in known]
+    cut = median(literacy) if literacy else None
+    splits = [
+        ("observance_self_report", "high", "observance_self_report >= 4", None, high, middle),
+        ("observance_self_report", "low", "observance_self_report <= 2", None, low, middle),
+        ("financial_literacy", "high", "financial_literacy > sample median", cut,
+         {s for s in known if by_id[s]["financial_literacy"] > cut} if known else set(), 0),
+        ("financial_literacy", "low", "financial_literacy <= sample median", cut,
+         {s for s in known if by_id[s]["financial_literacy"] <= cut} if known else set(), 0),
+    ]
+    rows = []
+    for covariate, level, rule, split_value, subjects, n_middle in splits:
+        for language in ("all", *PARTICIPANT_LANGUAGES):
+            members = {s for s in subjects if language == "all" or by_id[s]["survey_language"] == language}
+            if not members and language != "all":
+                continue
+            sets = _human_sets(buckets, design, "human_heterogeneity", [], subjects=members)
+            pairs = [pair for group in sets["complete"][PRIMARY_CONTRAST].values() for pair in group]
+            values = {metric: _cluster_values(pairs, metric) for metric in METRICS}
+            stats = _estimate_all(values, bootstrap, _rng(seed, ["heterogeneity", covariate, level, language]))
+            for metric in METRICS:
+                estimate, low_ci, high_ci, _p = stats[metric]
+                rows.append({"covariate": covariate, "level": level, "survey_language": language,
+                             "split_rule": rule, "split_value": split_value, "metric": metric,
+                             "unit": UNITS[metric], "contrast": PRIMARY_CONTRAST, "human_design": design,
+                             "estimate": estimate, "ci_low": low_ci, "ci_high": high_ci,
+                             "n_subjects_in_split": len(members),
+                             "n_subjects_contributing": len({s for pair in pairs for s in pair["subjects"]}),
+                             "n_pairs": len(pairs), "n_clusters": len(values[metric]),
+                             "n_middle_excluded": n_middle,
+                             "ci_method": "scenario_cluster_percentile" if low_ci is not None else "unavailable",
+                             "ci_unavailable_reason": _ci_reason(low_ci, bootstrap)})
+    return rows, set(observed)
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+def _design_summary(prepared):
+    trials = {}
+    for item in prepared["candidates"]:
+        trials.setdefault(item["trial"]["trial_id"], item["trial"])
+    scenarios = sorted({trial["scenario_id"] for trial in trials.values()})
+    prompts = {trial.get("prompt_sha256") or hashlib.sha256(str(trial.get("prompt")).encode()).hexdigest()
+               for trial in trials.values()}
+    summary = {
+        "n_trials_observed": len(trials), "n_scenarios": len(scenarios), "scenarios": scenarios,
+        "templates": sorted({trial["template_id"] for trial in trials.values()}),
+        "replicates": sorted({trial["replicate"] for trial in trials.values()}),
+        "conditions": sorted({trial["condition"] for trial in trials.values()}),
+        "distinct_prompt_texts": len(prompts), "warnings": [],
+    }
+    if len(scenarios) < MIN_SCENARIOS_FOR_GENERAL_CLAIMS:
+        summary["warnings"].append(
+            f"{prepared['label']}: only {len(scenarios)} distinct scenario(s) (< {MIN_SCENARIOS_FOR_GENERAL_CLAIMS}); "
+            "intervals describe only the sampled scenarios, not a wider population of financial situations.")
+    return summary
+
+
+def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=None, prereg_path=None,
+            human_design="auto", participants_path=None):
+    """Write contrasts, interactions, validity/bounds/scenario diagnostics and adjusted inference.
+
+    CIs are 95% scenario-cluster percentile intervals. Coverage denominators describe
     observed records/pairs, not trials absent from the supplied result files.
     """
     if isinstance(bootstrap, bool) or not isinstance(bootstrap, int) or bootstrap < 0:
         raise ValueError("bootstrap must be a nonnegative integer")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
+    if human_design not in HUMAN_DESIGNS:
+        raise ValueError(f"human_design must be one of {HUMAN_DESIGNS}")
+    if participants_path is not None and human_path is None:
+        raise ValueError("participants_path requires human_path")
+    prereg = _load_prereg(prereg_path) if prereg_path is not None else None
+    participants = _load_participants(participants_path) if participants_path is not None else None
     records = load_records(records_path)
     if any(isinstance(r, dict) and isinstance(r.get("result"), dict) and
            r["result"].get("provider") == "human" for r in records):
         raise ValueError("Model records must not contain human providers; use human_path")
-    groups, coverage, missingness, exclusions, warnings = _prepare(records, "model")
-    effects = _effects(groups, bootstrap, seed, "model")
-    interactions = _interactions(groups, bootstrap, seed, "model", exclusions)
-    comparisons = []
+    model = _prepare(records, "model")
+    contrasts = _select_contrasts(model["candidates"])
+    model_sets = _contrast_sets(model["buckets"], contrasts, "model", model["exclusions"])
+    effects = _effects(model, model_sets, contrasts, bootstrap, seed)
+    interaction_tables = _interactions(model, model_sets, contrasts, bootstrap, seed, model["exclusions"])
+    coverage = _coverage(model, model_sets, contrasts)
+    scenario_effects, scenario_robustness = _scenario_tables(model, model_sets, contrasts)
+    template_effects = _template_effects(model, model_sets, contrasts, bootstrap, seed)
+    validity = _validity_rows(model, model_sets, contrasts, bootstrap, seed)
+    bounds = _bounds_rows(model, model_sets, contrasts)
+    missingness = list(model["missingness"])
+    exclusions = list(model["exclusions"])
+    warnings = set(model["warnings"])
+    design_summary = {"model": _design_summary(model)}
+    comparisons, human_participant_rows, heterogeneity = [], [], []
     record_totals = {"model": len(records)}
+    resolved_design = None
     if human_path is not None:
         human_records = load_records(human_path)
         record_totals["human"] = len(human_records)
         if any(not isinstance(r, dict) or not isinstance(r.get("result"), dict) or
                r["result"].get("provider") != "human" for r in human_records):
             raise ValueError("human_path must contain imported human result records only")
-        humans, hc, hm, he, hw = _prepare(human_records, "human")
+        human = _prepare(human_records, "human")
         # A subject/trial observation may appear only once even if a caller relabels
         # its human provider model/version/generation metadata.
         identifiers = [(r["result"].get("subject_id"), r["trial"].get("trial_id"))
@@ -447,15 +1276,39 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                        and isinstance(r["trial"].get("trial_id"), str)]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Duplicate human (subject_id, trial_id) observations; comparisons would pseudoreplicate")
-        coverage.extend(hc)
-        missingness.extend(hm)
-        exclusions.extend(he)
-        warnings.update(hw)
-        effects.extend(_effects(humans, bootstrap, seed, "human"))
-        interactions.extend(_interactions(humans, bootstrap, seed, "human", exclusions))
-        comparisons = _human_comparisons(groups, humans, bootstrap, seed, exclusions)
+        resolved_design = _resolve_human_design(human["buckets"], human_design)
+        human_sets = _human_sets(human["buckets"], resolved_design, "human", human["exclusions"])
+        human_contrasts = [PRIMARY_CONTRAST]
+        coverage.extend(_coverage(human, human_sets, human_contrasts, unpaired=resolved_design == "unpaired"))
+        missingness.extend(human["missingness"])
+        exclusions.extend(human["exclusions"])
+        warnings.update(human["warnings"])
+        effects.extend(_effects(human, human_sets, human_contrasts, bootstrap, seed))
+        if resolved_design == "within":
+            human_interactions = _interactions(human, human_sets, human_contrasts, bootstrap, seed, exclusions)
+            for name, rows in human_interactions.items():
+                interaction_tables[name].extend(rows)
+        human_scenario_effects, human_scenario_robustness = _scenario_tables(human, human_sets, human_contrasts)
+        scenario_effects.extend(human_scenario_effects)
+        scenario_robustness.extend(human_scenario_robustness)
+        validity.extend(_validity_rows(human, human_sets, human_contrasts, bootstrap, seed,
+                                       contrast_effects=False))
+        comparisons = _human_comparisons(model_sets["complete"].get(PRIMARY_CONTRAST, {}),
+                                         human_sets["complete"][PRIMARY_CONTRAST], resolved_design,
+                                         bootstrap, seed, exclusions)
+        design_summary["human"] = _design_summary(human)
+        if participants is not None:
+            heterogeneity, observed = _heterogeneity(human["buckets"], resolved_design, participants,
+                                                     bootstrap, seed, exclusions)
+            human_participant_rows = _participant_tables(participants, observed)
+    for summary in design_summary.values():
+        warnings.update(summary["warnings"])
     if exclusions:
         warnings.add("Exclusions are explicit; consult exclusions and pair_coverage before interpreting complete-case effects.")
+    tables_for_inference = {"effects": effects, **interaction_tables}
+    preregistration = _apply_multiplicity(tables_for_inference, prereg)
+    if preregistration["unmatched_primary"]:
+        warnings.add(f"PREREGISTRATION: primary entries matched no analysis row: {', '.join(preregistration['unmatched_primary'])}")
     status_totals = []
     for source, denominator in record_totals.items():
         counts = Counter()
@@ -468,39 +1321,66 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                                   "count": counts[status], "denominator": denominator,
                                   "fraction": counts[status] / denominator if denominator else None})
     report = {
-        "schema_version": 1, "bootstrap": bootstrap, "seed": seed,
-        "confidence_level": .95, "effects": effects,
-        "language_interactions": interactions, "human_comparisons": comparisons,
+        "schema_version": 2, "bootstrap": bootstrap, "seed": seed, "confidence_level": .95,
+        "contrasts": contrasts, "primary_contrast": PRIMARY_CONTRAST, "human_design": resolved_design,
+        "effects": effects, **interaction_tables, "validity_effects": validity,
+        "bounds_effects": bounds, "scenario_robustness": scenario_robustness,
+        "template_effects_rows": len(template_effects), "scenario_effect_rows": len(scenario_effects),
+        "human_comparisons": comparisons, "human_participants": human_participant_rows,
+        "human_heterogeneity": heterogeneity,
+        "preregistration": preregistration, "design_summary": design_summary,
         "missingness": missingness, "pair_coverage": coverage, "exclusions": exclusions,
         "record_status_totals": status_totals,
         "warnings": sorted(warnings),
         "methods": {
-            "estimand": "Mean scenario-level event-minus-neutral complete-pair difference; average repetitions within subject/scenario, then subjects within scenario, then scenarios equally.",
-            "missingness": "No imputation; pair coverage uses observed pair IDs only. Grouped missingness covers attributable records; record_status_totals includes unstratifiable malformed records. Trials entirely absent from result files are not identifiable.",
-            "effects_ci": "Resample scenarios with replacement; no independent-generation or paraphrase pseudoreplication. Human-only effects CIs condition on the observed subjects.",
-            "language_interactions": "Subtract English paired effects only on identical matched task dimensions and subjects, then resample shared scenarios.",
-            "human_comparison": "Exact trial IDs and task/role metadata required. Matched complete-case model-minus-human paired effects; independently resample subjects and scenarios (crossed bootstrap). Sparse crossed designs can yield empty draws, which are counted and omitted. Subject/scenario selection and shared-task dependence limit population generalization.",
+            "claim": "Estimates describe calendar-cue sensitivity: the change in a particular model's (or human sample's) answers when specified prompt text changes, under the stated inference conditions. They do not measure beliefs, and they do not identify mediating mechanisms or causal pathways inside the model.",
+            "contrasts": "A_minus_B over matched conditions of the same pair. event_minus_neutral is the primary contrast (cue sensitivity). event_minus_no_calendar compares with a prompt carrying no calendar mention. event_minus_occasion_control separates auspiciousness from general occasion salience. event_minus_purchase_control separates it from a gold/purchase association without a festival. neutral_minus_no_calendar shows the effect of merely stating an ordinary day. persona_interactions (observant vs nonobservant) address preference accommodation; cue_interactions compare cue wording; language_interactions compare each language with English on matched tasks (wording and language remain confounded unless templates are independently reviewed). return_claim_deviation_pp = expected_return_pct minus the supplied gold expected return (contradicting a supplied assumption). reserve_shortfall_pct and reserve_violation measure failing a defined requirement (the stated liquidity reserve held entirely in cash).",
+            "estimand": "Mean scenario-level A-minus-B complete-pair difference; average repetitions (paraphrases, templates, replicates) within subject/scenario, then subjects within scenario, then scenarios equally. Complete-case is applied per contrast (both trials ok).",
+            "derived_metrics": "return_claim_deviation_pp = expected_return_pct - economics.gold_expected_annual_pct; reserve_shortfall_pct = max(0, 100*liquidity_need_inr/capital_inr - cash_pct); reserve_violation = 1 if shortfall > 0.01 else 0; wtp_premium_pct = 100*(willingness_to_pay_inr - gold_unit_price_inr)/gold_unit_price_inr. cash_pct equals 100 - gold_pct - equity_pct, is flagged derived_from_allocation and excluded from multiplicity families; buy_now is tied to timing_days and the reserve metrics to cash_pct, so related rows are not independent confirmations.",
+            "missingness": "No imputation in effects; pair coverage uses observed pair IDs only. Grouped missingness covers attributable records; record_status_totals includes unstratifiable malformed records. Trials entirely absent from result files are not identifiable and cannot be bounded.",
+            "validity_effects": "P(status ok) for condition A minus condition B over ALL attempted pairs (both trials have a record, whatever the status), averaged within scenario then across scenarios; plus valid-rate and status breakdowns by language, festival, cue, role, persona and condition. Complete-case effects describe the surviving subset of tasks, not all attempted tasks.",
+            "bounds_effects": "Worst-case (Manski-type) bounds of the cluster-averaged contrast over all attempted pairs, imputing every non-ok side with the lowest or highest value of the metric's support (gold/equity/cash 0-100, buy_now and reserve_violation 0-1, timing_days 0..max_delay_days, reserve_shortfall_pct 0..max(100, 100*liquidity/capital)). Unbounded metrics are listed with skipped_reason. Pairs structurally rejected or entirely absent are not part of the bounds.",
+            "scenario_robustness": "scenario_effects.csv holds each scenario's own contrast estimate; scenario_robustness reports n_scenarios, the share of scenarios whose sign equals the pooled sign, and min/max. template_effects.csv gives per-template estimates when more than one template is present. Main tables pool paraphrase/template/replicate within scenario. With fewer than 8 scenarios intervals describe only the sampled scenarios.",
+            "effects_ci": "Resample scenarios with replacement (one resample shared by all metrics of a group/contrast); no independent-generation or paraphrase pseudoreplication. Human-only effects CIs condition on the observed subjects.",
+            "inference": "p_value is a two-sided add-one bootstrap p: min(1, 2*min(#(b<=0)+1, #(b>=0)+1)/(B+1)) over the scenario bootstrap draws. Without a preregistration file every row is exploratory and Benjamini-Hochberg adjusted across all non-derived rows of the effects and interaction tables. With a preregistration, rows matching a primary entry form the primary family (Holm across that family only), flagged exceeds_mme (CI entirely beyond +-minimum_meaningful_effect) or within_mme (CI entirely inside); all other rows are exploratory and adjusted with the preregistered exploratory method. Rows without a bootstrap interval have no p-value. Unadjusted 95% percentile CIs; no causal identification from observational human/market data. A preregistration file alone does not specify hypotheses, exclusions or stopping rules beyond what it contains.",
+            "language_interactions": "Subtract reference-level (English / nonobservant / festival_named) paired effects only on identical matched task dimensions and subjects, then resample shared scenarios; persona_interactions and cue_interactions use the same rule on their dimension.",
+            "human_comparison": "Event_minus_neutral only. Exact trial IDs and task/role metadata required. 'within': each subject supplied both conditions of a pair; matched complete-case model-minus-human paired effects with crossed subject x scenario bootstrap. 'unpaired': each human response comes from a subject who saw one trial of the pair; per pair, human effect = mean of event responses minus mean of (different subjects') neutral responses (needs >=1 ok response on each side); the comparison is model pair effect minus human pair effect on identical pairs, averaged within scenario then across scenarios; the bootstrap resamples scenarios and subjects (within strata defined by the arm(s) each subject appeared in) and counts bootstrap_valid_draws; draws leaving no pair are omitted. Sparse designs can yield empty draws. Subject/scenario selection and shared-task dependence limit population generalization.",
+            "participants": "Optional self-reported covariates (survey language, language proficiency, researcher-defined financial literacy score, observance). human_heterogeneity.csv splits the human event_minus_neutral effect (same estimator as the chosen design) by observance (>=4 vs <=2, middle excluded and counted) and by financial literacy (<= vs > the sample median of subjects with responses); it is descriptive and is never used to adjust the model comparison. Subjects absent from the participants file are listed in exclusions.",
             "model_identity": "Provider, requested model, returned model version and generation settings are separate strata; unresolved versions cannot prove cross-run checkpoint identity.",
-            "inference": "Unadjusted exploratory 95% percentile CIs; no multiple-testing correction or causal identification from observational human/market data.",
             "units": UNITS,
         },
     }
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
+    stat = ("estimate", "ci_low", "ci_high", *INFERENCE_FIELDS)
+    interaction_columns = (*GROUP_FIELDS, "source", "dimension", "reference_level", "level", "metric", "unit",
+                           "contrast", "interaction", *stat, "matched_pairs", "n_clusters", "unmatched_tasks",
+                           "unmatched_reference_tasks", "ambiguous_task_matches", "ci_method", "ci_unavailable_reason")
     tables = {
-        "effects": (effects, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "estimate", "ci_low", "ci_high", "n_pairs", "n_clusters", "n_subjects", "ci_method", "ci_unavailable_reason")),
-        "language_interactions": (interactions, (*GROUP_FIELDS, "source", "reference_language", "metric", "unit", "contrast", "estimate", "ci_low", "ci_high", "matched_pairs", "n_clusters", "unmatched_language_tasks", "unmatched_english_tasks", "ambiguous_task_matches", "ci_method")),
-        "human_comparisons": (comparisons, (*GROUP_FIELDS, "metric", "unit", "contrast", "estimate", "ci_low", "ci_high", "matched_model_pairs", "matched_subject_pairs", "n_clusters", "n_subjects", "bootstrap_valid_draws", "ci_method", "ci_unavailable_reason", "unmatched_model_pairs")),
+        "effects": (effects, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", *stat, "n_pairs", "n_clusters", "n_subjects", "ci_method", "ci_unavailable_reason")),
+        **{name: (interaction_tables[name], interaction_columns) for name in MULTIPLICITY_TABLES},
+        "validity_effects": (validity, (*GROUP_FIELDS, "source", "row_type", "dimension", "level", "contrast", "estimate", "ci_low", "ci_high", "n_pairs", "n_clusters", "n_records", "n_ok", "n_invalid", "n_blocked", "n_error", "valid_rate", "ci_method", "ci_unavailable_reason")),
+        "bounds_effects": (bounds, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "estimate_complete_case", "bound_low", "bound_high", "bounds_exclude_zero", "n_pairs_attempted", "n_pairs_complete", "share_missing_one_side", "n_clusters_attempted", "skipped_reason")),
+        "scenario_effects": (scenario_effects, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "cluster_id", "estimate", "n_pairs")),
+        "scenario_robustness": (scenario_robustness, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "n_scenarios", "pooled_estimate", "share_same_sign", "min_scenario_estimate", "max_scenario_estimate")),
+        "template_effects": (template_effects, (*GROUP_FIELDS, "source", "template_id", "metric", "unit", "contrast", "estimate", "ci_low", "ci_high", "n_pairs", "n_clusters", "ci_method", "ci_unavailable_reason")),
+        "human_comparisons": (comparisons, (*GROUP_FIELDS, "metric", "unit", "contrast", "human_design", "estimate", "ci_low", "ci_high", "matched_model_pairs", "matched_human_units", "n_clusters", "n_subjects", "bootstrap_valid_draws", "ci_method", "ci_unavailable_reason", "unmatched_model_pairs")),
+        "human_participants": (human_participant_rows, ("survey_language", "n_participants", "n_with_responses", "language_proficiency_mean", "language_proficiency_min", "language_proficiency_max", "financial_literacy_mean", "financial_literacy_median", "financial_literacy_min", "financial_literacy_max", "observance_mean", "observance_high_n", "observance_middle_n", "observance_low_n")),
+        "human_heterogeneity": (heterogeneity, ("covariate", "level", "survey_language", "split_rule", "split_value", "metric", "unit", "contrast", "human_design", "estimate", "ci_low", "ci_high", "n_subjects_in_split", "n_subjects_contributing", "n_pairs", "n_clusters", "n_middle_excluded", "ci_method", "ci_unavailable_reason")),
         "missingness": (missingness, (*GROUP_FIELDS, "source", "status", "count", "denominator", "fraction")),
         "record_status_totals": (status_totals, ("source", "status", "count", "denominator", "fraction")),
-        "pair_coverage": (coverage, (*GROUP_FIELDS, "source", "observed_pairs", "complete_pairs", "excluded_pairs", "complete_pair_coverage", "n_clusters")),
-        "exclusions": (exclusions, ("source", "record_index", "pair_id", "reason")),
+        "pair_coverage": (coverage, (*GROUP_FIELDS, "source", "contrast", "observed_pairs", "attempted_pairs", "complete_pairs", "excluded_pairs", "complete_pair_coverage", "n_clusters")),
+        "exclusions": (exclusions, ("source", "record_index", "pair_id", "contrast", "reason", "detail")),
     }
     report["outputs"] = {name: str(directory / f"{name}.csv") for name in tables}
     report["outputs"]["analysis"] = str(directory / "analysis.json")
     for name, (rows, fields) in tables.items():
         _csv_write(directory / f"{name}.csv", rows, fields)
     _json_write(directory / "analysis.json", report)
+    if preregistration["unmatched_primary"]:
+        raise ValueError("Preregistered primary entries matched no analysis row: "
+                         f"{', '.join(preregistration['unmatched_primary'])}. Outputs were still written to {directory} "
+                         "with the entries listed under preregistration.unmatched_primary.")
     return report
 
 
@@ -510,6 +1390,8 @@ def import_humans(trials_path, csv_path, output_path):
     CSV booleans are true/false (case insensitive) or 1/0. Invalid answer cells
     become invalid result records; unknown trial IDs and duplicate observations
     are structural errors and abort the import before any output is written.
+    Each subject may answer one trial of a pair (between-subject / counterbalanced
+    designs, analysed with the unpaired estimator) or both (within design).
     """
     trials = read_jsonl(trials_path)
     validate_trials(trials)
@@ -532,7 +1414,7 @@ def import_humans(trials_path, csv_path, output_path):
                   "generation": {}, "usage": {}, "attempts": 1, "subject_id": subject_id,
                   "status": "ok", "payload": None, "raw_text": _canonical(raw_cells), "error": None}
         try:
-            answer = {field: float(row[field]) for field in METRICS if field not in ("buy_now", "timing_days")}
+            answer = {field: float(row[field]) for field in PAYLOAD_METRICS if field not in ("buy_now", "timing_days")}
             flag = row["buy_now"].strip().lower()
             if flag not in ("true", "false", "1", "0"):
                 raise ValueError("buy_now must be true/false or 1/0")

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "data_path": "../data/stimuli.json",
+  "mode": "exploratory",
+  "seed": 42,
+  "languages": ["en"],
+  "festivals": ["dhanteras"],
+  "roles": ["investor"],
+  "personas": ["unspecified"],
+  "scenarios": ["emergency_buffer"],
+  "paraphrases": ["direct"],
+  "cues": ["festival_named"],
+  "controls": ["no_calendar", "occasion_control", "purchase_control"],
+  "templates": ["t1", "t2"],
+  "replicates": 1
+}

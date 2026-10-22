@@ -98,14 +98,26 @@ def load_records(path):
     return read_jsonl(path)
 
 
-def validate_trials(trials, confirmatory=False):
+CONDITIONS = ("event", "neutral")
+CONTROL_CONDITIONS = ("no_calendar", "occasion_control", "purchase_control")
+
+
+def load_review_context(trials_path, confirmatory):
+    """Review materials live in a per-corpus sidecar; only confirmatory work needs them."""
+    if not confirmatory:
+        return None
+    from .stimuli import load_review_context as load
+    return load(trials_path)
+
+
+def validate_trials(trials, confirmatory=False, review_context=None):
     if not trials:
         raise ValueError("No trials")
     ids, pairs, splits = set(), {}, {}
     required = {
         "trial_id", "pair_id", "cluster_id", "split", "language", "festival",
         "condition", "event_valence", "cue", "role", "persona_id", "scenario_id",
-        "paraphrase_id", "replicate", "prompt", "prompt_sha256", "review_status", "review",
+        "paraphrase_id", "template_id", "replicate", "prompt", "prompt_sha256", "review_status", "review",
     }
     for trial in trials:
         missing = required - trial.keys()
@@ -119,7 +131,7 @@ def validate_trials(trials, confirmatory=False):
         if hashlib.sha256(trial["prompt"].encode()).hexdigest() != trial["prompt_sha256"]:
             raise ValueError("Prompt content hash mismatch; rebuild trials")
         for field, allowed in {
-            "condition": {"event", "neutral"}, "split": {"train", "dev", "test"},
+            "condition": {*CONDITIONS, *CONTROL_CONDITIONS}, "split": {"train", "dev", "test"},
             "language": {"en", "hi", "ta", "gu", "bn"},
             "festival": {"dhanteras", "akshaya_tritiya", "muhurat", "pitru_paksha"},
             "event_valence": {"auspicious", "avoidance"},
@@ -140,15 +152,20 @@ def validate_trials(trials, confirmatory=False):
         pair[trial["condition"]] = trial
         if confirmatory:
             from .stimuli import validate_trial_review
-            validate_trial_review(trial)
+            validate_trial_review(trial, review_context)
     # All factors must match inside a counterfactual pair, except treatment text/review.
     matched_fields = required - {"trial_id", "condition", "prompt", "prompt_sha256", "review_status", "review"}
+    condition_sets = set()
     for pair_id, pair in pairs.items():
-        if set(pair) != {"event", "neutral"}:
+        if not set(CONDITIONS) <= set(pair):
             raise ValueError(f"Incomplete counterfactual pair: {pair_id}")
-        for field in matched_fields:
-            if pair["event"][field] != pair["neutral"][field]:
-                raise ValueError(f"Pair {pair_id} mismatches {field}")
+        condition_sets.add(frozenset(pair))
+        for condition, trial in pair.items():
+            for field in matched_fields:
+                if pair["event"][field] != trial[field]:
+                    raise ValueError(f"Pair {pair_id} mismatches {field} in {condition}")
+    if len(condition_sets) > 1:
+        raise ValueError("Pairs have inconsistent condition sets; every pair must carry the same controls")
     if confirmatory:
         cohort_hash = digest(sorted(ids))
         if any(trial.get("design_trial_count") != len(trials) or
@@ -208,9 +225,10 @@ def _select_trials(trials, limit):
     # Hash order spreads conditions/languages over time without mutable RNG state.
     order = sorted(pairs, key=lambda p: hashlib.sha256(p.encode()).hexdigest())
     if limit is not None:
-        if limit < 2:
-            raise ValueError("limit must be >=2; complete pairs are retained")
-        order = order[:limit // 2]
+        size = len(pairs[order[0]])
+        if limit < size:
+            raise ValueError(f"limit must be >= {size}: complete pairs (all conditions) are retained")
+        order = order[:limit // size]
     selected = [t for p in order for t in pairs[p]]
     return sorted(selected, key=lambda t: hashlib.sha256(t["trial_id"].encode()).hexdigest())
 
@@ -218,7 +236,8 @@ def _select_trials(trials, limit):
 def run_trials(trials_path, output_dir, provider, *, confirmatory=False, concurrency=2,
                limit=None, retry_errors=False):
     trials = read_jsonl(trials_path)
-    validate_trials(trials, confirmatory=confirmatory)
+    validate_trials(trials, confirmatory=confirmatory,
+                    review_context=load_review_context(trials_path, confirmatory))
     if concurrency < 1:
         raise ValueError("concurrency must be positive")
     if confirmatory and limit is not None:

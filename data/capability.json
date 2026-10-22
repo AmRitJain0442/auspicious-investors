@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "status": "DRAFT: AI-drafted arithmetic items and translations; NOT independently human-authored or bilingual-reviewed. Review before using any capability number in a publication.",
+  "provenance": {
+    "authorship": "AI-drafted; answers are computed from the stored params by the formula for each kind (openweights._CAPABILITY_FORMULAS) and re-checked by tests/test_openweights.py with independent arithmetic.",
+    "scoring": "Strict JSON object {\"answer\": number}; correct if absolute error <= 0.01 or relative error <= 0.1%. Latin digits in every language.",
+    "purpose": "Detect general arithmetic/financial-reasoning disruption under steering; not a benchmark and not related to calendar cues."
+  },
+  "languages": {
+    "en": {
+      "instruction": "Reply with only a JSON object of the form {\"answer\": <number>} and write the number with Latin digits (0-9), with no units and no thousands separators.",
+      "templates": {
+        "percent_of": "What is {percent}% of {amount} INR?",
+        "compound_growth": "An investment of {principal} INR grows at {rate_pct}% per year, compounded annually. What is its value in INR after {years} years?",
+        "cash_remainder": "A portfolio of {total} INR is split as {gold_pct}% gold and {equity_pct}% equity, with the remainder held in cash. How many INR are held in cash?",
+        "return_difference": "You invest {principal} INR for one year. Option A returns {rate_a_pct}% and Option B returns {rate_b_pct}%. How many more INR does Option A earn than Option B?",
+        "expected_value": "A bet pays {gain} INR with probability {prob_pct}% and loses {loss} INR otherwise. What is the expected net payoff in INR?"
+      }
+    },
+    "hi": {
+      "instruction": "केवल इस रूप में एक JSON ऑब्जेक्ट लिखें: {\"answer\": <संख्या>}। संख्या को लैटिन अंकों (0-9) में लिखें, बिना इकाई और बिना हज़ार-विभाजक के।",
+      "templates": {
+        "percent_of": "{amount} रुपये का {percent}% कितना होता है?",
+        "compound_growth": "{principal} रुपये का निवेश प्रति वर्ष {rate_pct}% की दर से वार्षिक चक्रवृद्धि पर बढ़ता है। {years} वर्ष बाद उसका मूल्य कितने रुपये होगा?",
+        "cash_remainder": "{total} रुपये के पोर्टफोलियो में {gold_pct}% सोना और {equity_pct}% इक्विटी है, शेष राशि नकद में रखी गई है। नकद में कितने रुपये रखे गए हैं?",
+        "return_difference": "आप {principal} रुपये एक वर्ष के लिए निवेश करते हैं। विकल्प A पर {rate_a_pct}% और विकल्प B पर {rate_b_pct}% रिटर्न मिलता है। विकल्प A, विकल्प B से कितने रुपये अधिक कमाता है?",
+        "expected_value": "एक दांव में {prob_pct}% संभावना से {gain} रुपये मिलते हैं और अन्यथा {loss} रुपये का नुकसान होता है। अपेक्षित शुद्ध लाभ कितने रुपये है?"
+      }
+    },
+    "ta": {
+      "instruction": "இந்த வடிவில் ஒரு JSON பொருளை மட்டும் எழுதுங்கள்: {\"answer\": <எண்>}. எண்ணை லத்தீன் இலக்கங்களில் (0-9) எழுதுங்கள்; அலகு, ஆயிரம் பிரிப்பான் வேண்டாம்.",
+      "templates": {
+        "percent_of": "{amount} ரூபாயில் {percent}% எவ்வளவு?",
+        "compound_growth": "{principal} ரூபாய் முதலீடு ஆண்டுக்கு {rate_pct}% ஆண்டு கூட்டு வட்டியில் வளர்கிறது. {years} ஆண்டுகளுக்குப் பிறகு அதன் மதிப்பு எத்தனை ரூபாய்?",
+        "cash_remainder": "{total} ரூபாய் மதிப்புள்ள போர்ட்ஃபோலியோவில் {gold_pct}% தங்கமும் {equity_pct}% பங்குகளும் உள்ளன; மீதமுள்ள தொகை ரொக்கமாக வைக்கப்பட்டுள்ளது. ரொக்கமாக எத்தனை ரூபாய் உள்ளது?",
+        "return_difference": "நீங்கள் {principal} ரூபாயை ஒரு ஆண்டுக்கு முதலீடு செய்கிறீர்கள். விருப்பம் A {rate_a_pct}% வருமானமும் விருப்பம் B {rate_b_pct}% வருமானமும் தருகிறது. விருப்பம் B-ஐ விட விருப்பம் A எத்தனை ரூபாய் அதிகம் ஈட்டுகிறது?",
+        "expected_value": "ஒரு பந்தயத்தில் {prob_pct}% நிகழ்தகவுடன் {gain} ரூபாய் கிடைக்கும்; இல்லையெனில் {loss} ரூபாய் இழப்பு. எதிர்பார்க்கப்படும் நிகர ஆதாயம் எத்தனை ரூபாய்?"
+      }
+    },
+    "gu": {
+      "instruction": "ફક્ત આ સ્વરૂપમાં એક JSON ઑબ્જેક્ટ લખો: {\"answer\": <સંખ્યા>}. સંખ્યા લેટિન અંકો (0-9) માં લખો, એકમ અને હજાર-વિભાજક વિના.",
+      "templates": {
+        "percent_of": "{amount} રૂપિયાના {percent}% કેટલા થાય?",
+        "compound_growth": "{principal} રૂપિયાનું રોકાણ વાર્ષિક {rate_pct}% ના દરે વાર્ષિક ચક્રવૃદ્ધિ સાથે વધે છે. {years} વર્ષ પછી તેની કિંમત કેટલા રૂપિયા થશે?",
+        "cash_remainder": "{total} રૂપિયાના પોર્ટફોલિયોમાં {gold_pct}% સોનું અને {equity_pct}% ઇક્વિટી છે, બાકીની રકમ રોકડમાં રાખવામાં આવી છે. રોકડમાં કેટલા રૂપિયા છે?",
+        "return_difference": "તમે {principal} રૂપિયા એક વર્ષ માટે રોકો છો. વિકલ્પ A પર {rate_a_pct}% અને વિકલ્પ B પર {rate_b_pct}% વળતર મળે છે. વિકલ્પ B કરતાં વિકલ્પ A કેટલા રૂપિયા વધુ કમાય છે?",
+        "expected_value": "એક દાવમાં {prob_pct}% સંભાવનાથી {gain} રૂપિયા મળે છે અને અન્યથા {loss} રૂપિયાનું નુકસાન થાય છે. અપેક્ષિત ચોખ્ખો નફો કેટલા રૂપિયા છે?"
+      }
+    },
+    "bn": {
+      "instruction": "শুধু এই আকারে একটি JSON অবজেক্ট লিখুন: {\"answer\": <সংখ্যা>}। সংখ্যাটি ল্যাটিন অঙ্কে (0-9) লিখুন, একক বা হাজার-বিভাজক ছাড়া।",
+      "templates": {
+        "percent_of": "{amount} টাকার {percent}% কত?",
+        "compound_growth": "{principal} টাকার বিনিয়োগ বছরে {rate_pct}% হারে বার্ষিক চক্রবৃদ্ধি সুদে বাড়ে। {years} বছর পরে এর মূল্য কত টাকা হবে?",
+        "cash_remainder": "{total} টাকার পোর্টফোলিওতে {gold_pct}% সোনা ও {equity_pct}% ইক্যুইটি আছে, বাকি অংশ নগদে রাখা হয়েছে। নগদে কত টাকা আছে?",
+        "return_difference": "আপনি এক বছরের জন্য {principal} টাকা বিনিয়োগ করেন। বিকল্প A-তে {rate_a_pct}% এবং বিকল্প B-তে {rate_b_pct}% রিটার্ন পাওয়া যায়। বিকল্প B-এর চেয়ে বিকল্প A কত টাকা বেশি আয় করে?",
+        "expected_value": "একটি বাজিতে {prob_pct}% সম্ভাবনায় {gain} টাকা পাওয়া যায় এবং অন্যথায় {loss} টাকা হারাতে হয়। প্রত্যাশিত নিট লাভ কত টাকা?"
+      }
+    }
+  },
+  "items": [
+    {"id": "c01", "kind": "percent_of", "params": {"amount": 2000, "percent": 15}, "answer": 300},
+    {"id": "c02", "kind": "compound_growth", "params": {"principal": 10000, "rate_pct": 10, "years": 2}, "answer": 12100},
+    {"id": "c03", "kind": "cash_remainder", "params": {"total": 200000, "gold_pct": 40, "equity_pct": 35}, "answer": 50000},
+    {"id": "c04", "kind": "return_difference", "params": {"principal": 100000, "rate_a_pct": 9, "rate_b_pct": 6}, "answer": 3000},
+    {"id": "c05", "kind": "expected_value", "params": {"prob_pct": 60, "gain": 5000, "loss": 2000}, "answer": 2200},
+    {"id": "c06", "kind": "percent_of", "params": {"amount": 85000, "percent": 12}, "answer": 10200},
+    {"id": "c07", "kind": "compound_growth", "params": {"principal": 50000, "rate_pct": 8, "years": 3}, "answer": 62985.6},
+    {"id": "c08", "kind": "cash_remainder", "params": {"total": 80000, "gold_pct": 55, "equity_pct": 30}, "answer": 12000},
+    {"id": "c09", "kind": "return_difference", "params": {"principal": 40000, "rate_a_pct": 12.5, "rate_b_pct": 7.5}, "answer": 2000},
+    {"id": "c10", "kind": "expected_value", "params": {"prob_pct": 25, "gain": 12000, "loss": 3000}, "answer": 750},
+    {"id": "c11", "kind": "percent_of", "params": {"amount": 640, "percent": 2.5}, "answer": 16},
+    {"id": "c12", "kind": "compound_growth", "params": {"principal": 2000, "rate_pct": 5, "years": 2}, "answer": 2205},
+    {"id": "c13", "kind": "cash_remainder", "params": {"total": 150000, "gold_pct": 20, "equity_pct": 70}, "answer": 15000},
+    {"id": "c14", "kind": "return_difference", "params": {"principal": 250000, "rate_a_pct": 7, "rate_b_pct": 4.5}, "answer": 6250},
+    {"id": "c15", "kind": "expected_value", "params": {"prob_pct": 50, "gain": 800, "loss": 300}, "answer": 250}
+  ]
+}
