@@ -383,20 +383,20 @@ def _design_count(materials):
     return count * cue_count
 
 
-# Single-entry cache: verifying a context hashes all materials, which must happen once
-# per context object, not once per trial. Contexts must not be mutated after first use
-# (load_review_context returns fresh objects; tamper-test with a deepcopy).
-_CONTEXT_CACHE = {"context": None, "info": None}
+# Cache approval checks only while the current material and manifest bytes still match.
+# Object identity alone is insufficient because callers can mutate nested dictionaries.
+_CONTEXT_CACHE = {"context": None, "fingerprint": None, "info": None}
 
 
 def _verified_context(review_context):
-    if review_context is not None and _CONTEXT_CACHE["context"] is review_context:
-        return _CONTEXT_CACHE["info"]
     if not isinstance(review_context, dict):
         raise ValueError("Missing review sidecar: confirmatory validation requires the <trials>.review.json context")
     materials, manifest = review_context["materials"], review_context.get("manifest")
-    if review_context.get("schema_version") != SIDECAR_SCHEMA_VERSION or review_context["context_sha256"] != _hash({"materials": materials, "manifest": manifest}):
+    fingerprint = _hash({"materials": materials, "manifest": manifest})
+    if review_context.get("schema_version") != SIDECAR_SCHEMA_VERSION or review_context["context_sha256"] != fingerprint:
         raise ValueError("Review context hash mismatch")
+    if (_CONTEXT_CACHE["context"] is review_context and _CONTEXT_CACHE["fingerprint"] == fingerprint):
+        return _CONTEXT_CACHE["info"]
     _check_manifest(manifest, materials)
     config = materials["design"]["config"]
     _check_controls(config.get("cues", CUES), config.get("controls", []))
@@ -406,7 +406,7 @@ def _verified_context(review_context):
         calendar_hash = _hash(materials["calendar"])
     info = {"context_sha256": review_context["context_sha256"], "materials": materials, "config": config, "config_sha256": _hash(config), "design": materials["design"],
             "count": _design_count(materials), "calendar_hash": calendar_hash, "pairs": {p["id"]: p for p in materials.get("calendar", {}).get("pairs", [])}}
-    _CONTEXT_CACHE.update(context=review_context, info=info)
+    _CONTEXT_CACHE.update(context=review_context, fingerprint=fingerprint, info=info)
     return info
 
 

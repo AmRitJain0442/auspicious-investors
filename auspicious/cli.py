@@ -87,6 +87,8 @@ def parser():
     analysis.add_argument("--seed", type=int, default=42)
     analysis.add_argument("--humans", help="Validated human records JSONL from import-humans")
     analysis.add_argument("--prereg", help="Preregistration JSON declaring primary contrasts and minimum effects")
+    analysis.add_argument("--return-tolerance-pp", type=float,
+                          help="Absolute return-error tolerance in percentage points (default 0.01 or prereg value)")
     analysis.add_argument("--human-design", choices=("auto", "within", "unpaired"), default="auto")
     analysis.add_argument("--participants", help="Validated participant covariates JSON from import-participants")
     human = commands.add_parser("import-humans", help="Validate observed same-task participant CSV responses")
@@ -186,7 +188,8 @@ def dispatch(args):
         from .analysis import analyze
         return analyze(args.records, args.out, bootstrap=args.bootstrap, seed=args.seed,
                        human_path=args.humans, prereg_path=args.prereg,
-                       human_design=args.human_design, participants_path=args.participants)
+                       human_design=args.human_design, participants_path=args.participants,
+                       return_tolerance_pp=args.return_tolerance_pp)
     if args.command == "import-humans":
         from .analysis import import_humans
         return import_humans(args.trials, args.csv, args.out)

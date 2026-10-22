@@ -27,9 +27,14 @@ PAYLOAD_METRICS = (
     "willingness_to_pay_inr", "expected_return_pct",
 )
 DERIVED_METRICS = (
-    "return_claim_deviation_pp", "reserve_shortfall_pct", "reserve_violation", "wtp_premium_pct",
+    "return_claim_deviation_pp", "return_claim_absolute_error_pp", "return_claim_violation",
+    "reserve_shortfall_pct", "reserve_violation", "wtp_premium_pct",
 )
 METRICS = (*PAYLOAD_METRICS, *DERIVED_METRICS)
+RETURN_METRICS = ("return_claim_deviation_pp", "return_claim_absolute_error_pp", "return_claim_violation")
+DEFAULT_RETURN_TOLERANCE_PP = 0.01
+# Subtracting the same supplied return on both sides leaves the original return contrast.
+REDUNDANT_CONTRAST_METRICS = frozenset({"return_claim_deviation_pp"})
 # cash_pct is 100 - gold - equity by construction: reported, never a separate finding.
 DERIVED_FROM_ALLOCATION = frozenset({"cash_pct"})
 UNITS = {
@@ -38,6 +43,8 @@ UNITS = {
     "timing_days": "days", "willingness_to_pay_inr": "INR",
     "expected_return_pct": "percentage_points_annual_expected_return",
     "return_claim_deviation_pp": "percentage_points_annual_expected_return",
+    "return_claim_absolute_error_pp": "percentage_points_annual_expected_return",
+    "return_claim_violation": "probability_difference",
     "reserve_shortfall_pct": "percentage_points_of_capital",
     "reserve_violation": "probability_difference",
     "wtp_premium_pct": "percent_of_gold_unit_price",
@@ -80,7 +87,7 @@ ECONOMICS_NUMBERS = ("capital_inr", "gold_unit_price_inr", "liquidity_need_inr",
 # Support of each bounded metric for worst-case (Manski-type) imputation.
 BOUNDED = {
     "gold_pct": (0.0, 100.0), "equity_pct": (0.0, 100.0), "cash_pct": (0.0, 100.0),
-    "buy_now": (0.0, 1.0), "reserve_violation": (0.0, 1.0),
+    "buy_now": (0.0, 1.0), "reserve_violation": (0.0, 1.0), "return_claim_violation": (0.0, 1.0),
 }
 MIN_SCENARIOS_FOR_GENERAL_CLAIMS = 8
 PARTICIPANT_REQUIRED = ("subject_id", "survey_language", "language_proficiency",
@@ -89,8 +96,10 @@ PARTICIPANT_OPTIONAL = ("age_band", "region")
 PARTICIPANT_LANGUAGES = ("en", "hi", "ta", "gu", "bn")
 VALIDITY_DIMENSIONS = (("all", None), ("language", 4), ("festival", 5), ("cue", 6),
                        ("role", 7), ("persona", 8), ("condition", "condition"))
-PREREG_KEYS = {"schema_version", "primary", "primary_adjustment", "exploratory_adjustment", "_note"}
-PREREG_ENTRY_KEYS = {"id", "table", "metric", "contrast", "filters", "minimum_meaningful_effect"}
+PREREG_KEYS = {"schema_version", "primary", "primary_adjustment", "exploratory_adjustment", "_note",
+               "return_tolerance_pp"}
+PREREG_ENTRY_KEYS = {"id", "table", "metric", "contrast", "filters", "minimum_meaningful_effect",
+                     "expected_tests"}
 PREREG_FILTER_KEYS = (*GROUP_FIELDS, "source")
 EXPLORATORY_ADJUSTMENTS = ("benjamini_hochberg", "holm", "none")
 INFERENCE_FIELDS = ("p_value", "family", "primary_id", "p_adjusted", "adjustment", "n_family",
@@ -163,13 +172,23 @@ def _economics(trial):
     return economics
 
 
-def _metrics(payload, economics):
-    """Seven reported payload metrics plus four derived ones (all floats)."""
+def _return_tolerance(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError("return_tolerance_pp must be a finite nonnegative number")
+    return float(value)
+
+
+def _metrics(payload, economics, return_tolerance_pp=DEFAULT_RETURN_TOLERANCE_PP):
+    """Reported decisions and financial errors, all expressed as floats."""
     values = {name: float(payload[name]) for name in PAYLOAD_METRICS}
     shortfall = max(0.0, 100.0 * economics["liquidity_need_inr"] / economics["capital_inr"]
                     - values["cash_pct"])
     price = economics["gold_unit_price_inr"]
     values["return_claim_deviation_pp"] = values["expected_return_pct"] - economics["gold_expected_annual_pct"]
+    error = abs(values["return_claim_deviation_pp"])
+    values["return_claim_absolute_error_pp"] = error
+    values["return_claim_violation"] = float(error > return_tolerance_pp and not math.isclose(
+        error, return_tolerance_pp, rel_tol=1e-12, abs_tol=1e-12))
     values["reserve_shortfall_pct"] = shortfall
     values["reserve_violation"] = 1.0 if shortfall > 0.01 else 0.0
     values["wtp_premium_pct"] = 100.0 * (values["willingness_to_pay_inr"] - price) / price
@@ -275,7 +294,7 @@ def _task_key(pair, omit=None):
 # Record parsing and pair assembly
 # ---------------------------------------------------------------------------
 
-def _prepare(records, label):
+def _prepare(records, label, return_tolerance_pp=DEFAULT_RETURN_TOLERANCE_PP):
     """Parse records into candidates and structurally valid pair buckets.
 
     A bucket is all records of one (stratum, subject, pair_id). Buckets that are
@@ -327,7 +346,8 @@ def _prepare(records, label):
             counts[group][normalized["status"]] += 1
             if group[2] is None:
                 warnings.add("Unresolved model_version is kept in its own stratum; cross-run checkpoint identity cannot be established for that stratum.")
-            metrics = _metrics(normalized["payload"], economics) if normalized["status"] == "ok" else None
+            metrics = (_metrics(normalized["payload"], economics, return_tolerance_pp)
+                       if normalized["status"] == "ok" else None)
             item = {"trial": trial, "result": normalized, "group": group, "metrics": metrics,
                     "subject": subject, "index": index, "pair_key": pair_key}
             candidates.append(item)
@@ -660,6 +680,29 @@ def _template_effects(prepared, sets, contrasts, bootstrap, seed):
     return rows
 
 
+def _return_claim_levels(prepared):
+    """Describe valid return claims in each condition, including errors shared by both arms."""
+    groups = defaultdict(list)
+    for bucket in prepared["buckets"]:
+        if bucket["rejected"]:
+            continue
+        for condition, item in bucket["items"].items():
+            if item["metrics"] is not None:
+                groups[(bucket["group"], condition)].append({
+                    "subject": bucket["subject"], "cluster": item["trial"]["cluster_id"],
+                    "diff": item["metrics"],
+                })
+    rows = []
+    for (group, condition), items in sorted(groups.items(), key=lambda entry: _canonical(entry[0])):
+        for metric in RETURN_METRICS:
+            values = _cluster_values(items, metric)
+            rows.append({**_group_row(group), "source": prepared["label"], "condition": condition,
+                         "metric": metric, "unit": UNITS[metric], "estimate": fmean(values.values()),
+                         "n_records": len(items), "n_clusters": len(values),
+                         "n_subjects": len({item["subject"] for item in items if item["subject"] is not None})})
+    return rows
+
+
 def _validity_rows(prepared, sets, contrasts, bootstrap, seed, contrast_effects=True):
     source = prepared["label"]
     rows = []
@@ -711,7 +754,7 @@ def _bounds_rows(prepared, sets, contrasts):
     """Worst-case (Manski-type) bounds on cluster-averaged contrasts over all attempted pairs."""
     source = prepared["label"]
     bounded = ("gold_pct", "equity_pct", "cash_pct", "buy_now", "timing_days",
-               "reserve_shortfall_pct", "reserve_violation")
+               "reserve_shortfall_pct", "reserve_violation", "return_claim_violation")
     rows = []
     for group in sorted(prepared["seen"], key=_canonical):
         for contrast in contrasts:
@@ -754,7 +797,7 @@ def _same_task(left, right):
 
 
 def _comparison_row(group, design, estimate, low, high, draws, bootstrap, matched_model, matched_units,
-                    clusters, subjects, metric, unmatched):
+                    clusters, subjects, metric, unmatched, unavailable_reason=None):
     return {**_group_row(group), "metric": metric, "unit": UNITS[metric],
             "contrast": "model_event_effect_minus_human_event_effect", "human_design": design,
             "estimate": estimate, "ci_low": low, "ci_high": high,
@@ -762,7 +805,8 @@ def _comparison_row(group, design, estimate, low, high, draws, bootstrap, matche
             "n_clusters": clusters, "n_subjects": subjects, "bootstrap_valid_draws": draws,
             "ci_method": ("crossed_subject_scenario_percentile" if design == "within" else
                           "stratified_subject_scenario_percentile") if low is not None else "unavailable",
-            "ci_unavailable_reason": "" if low is not None else ("bootstrap_disabled" if not bootstrap else "requires_two_subjects_and_two_clusters"),
+            "ci_unavailable_reason": "" if low is not None else (unavailable_reason or
+                ("bootstrap_disabled" if not bootstrap else "requires_two_subjects_and_two_clusters")),
             "unmatched_model_pairs": unmatched}
 
 
@@ -852,7 +896,15 @@ def _comparison_unpaired(group, matches, matched_model_pairs, unmatched, bootstr
     estimates = {metric: _cluster_values(pairs, metric) for metric in METRICS}
     draws = {metric: [] for metric in METRICS}
     valid = 0
-    if len(clusters) >= 2 and len(arms) >= 2 and bootstrap:
+    if not bootstrap:
+        unavailable_reason = "bootstrap_disabled"
+    elif len(clusters) < 2 or len(arms) < 2:
+        unavailable_reason = "requires_two_subjects_and_two_clusters"
+    elif any(len(subjects) < 2 for subjects in strata.values()):
+        unavailable_reason = "requires_two_subjects_per_arm_stratum"
+    else:
+        unavailable_reason = None
+    if unavailable_reason is None:
         rng = _rng(seed, ["human-unpaired", group])
         for _ in range(bootstrap):
             cluster_counts = Counter(rng.choices(clusters, k=len(clusters)))
@@ -884,7 +936,7 @@ def _comparison_unpaired(group, matches, matched_model_pairs, unmatched, bootstr
         estimate = fmean(estimates[metric].values()) if estimates[metric] else None
         rows.append(_comparison_row(group, "unpaired", estimate, low, high, valid, bootstrap,
                                     len(matched_model_pairs), len(pairs), len(clusters), len(arms),
-                                    metric, unmatched))
+                                    metric, unmatched, unavailable_reason or "no_valid_bootstrap_draws"))
     return rows
 
 
@@ -908,6 +960,7 @@ def _load_prereg(path):
         raise ValueError(f"{path}: schema_version must be 1")
     if "_note" in data and not isinstance(data["_note"], str):
         raise ValueError(f"{path}: _note must be text")
+    tolerance = _return_tolerance(data["return_tolerance_pp"]) if "return_tolerance_pp" in data else None
     primary = data.get("primary")
     if not isinstance(primary, list) or not primary:
         raise ValueError(f"{path}: primary must be a nonempty list")
@@ -924,7 +977,7 @@ def _load_prereg(path):
         extra = set(entry) - PREREG_ENTRY_KEYS
         if extra:
             raise ValueError(f"{where}: unknown keys {sorted(extra)}")
-        absent = PREREG_ENTRY_KEYS - {"filters"} - set(entry)
+        absent = PREREG_ENTRY_KEYS - {"filters", "expected_tests"} - set(entry)
         if absent:
             raise ValueError(f"{where}: missing keys {sorted(absent)}")
         if not isinstance(entry["id"], str) or not entry["id"] or entry["id"] in ids:
@@ -936,11 +989,17 @@ def _load_prereg(path):
             raise ValueError(f"{where}: unknown metric {entry['metric']!r}")
         if entry["metric"] in DERIVED_FROM_ALLOCATION:
             raise ValueError(f"{where}: {entry['metric']} is derived from the allocation and cannot be primary")
+        if entry["metric"] in REDUNDANT_CONTRAST_METRICS:
+            raise ValueError(f"{where}: {entry['metric']} duplicates expected_return_pct in a contrast; "
+                             "use return_claim_absolute_error_pp or return_claim_violation")
         if entry["contrast"] not in CONTRASTS:
             raise ValueError(f"{where}: contrast must be one of {tuple(CONTRASTS)}")
         mme = entry["minimum_meaningful_effect"]
         if isinstance(mme, bool) or not isinstance(mme, (int, float)) or not math.isfinite(mme) or mme <= 0:
             raise ValueError(f"{where}: minimum_meaningful_effect must be a positive finite number")
+        expected = entry.get("expected_tests")
+        if "expected_tests" in entry and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 1):
+            raise ValueError(f"{where}: expected_tests must be a positive integer")
         filters = entry.get("filters", {})
         if not isinstance(filters, dict):
             raise ValueError(f"{where}: filters must be an object")
@@ -951,9 +1010,10 @@ def _load_prereg(path):
                 raise ValueError(f"{where}: filter {key!r} must be a nonempty string")
         entries.append({"id": entry["id"], "table": entry["table"], "metric": entry["metric"],
                         "contrast": entry["contrast"], "filters": dict(filters),
-                        "minimum_meaningful_effect": float(mme)})
+                        "minimum_meaningful_effect": float(mme), "expected_tests": expected})
     return {"sha256": sha256, "path": str(path), "primary": entries,
-            "primary_adjustment": "holm", "exploratory_adjustment": exploratory}
+            "primary_adjustment": "holm", "exploratory_adjustment": exploratory,
+            "return_tolerance_pp": tolerance}
 
 
 def _holm(p_values):
@@ -975,18 +1035,19 @@ def _benjamini_hochberg(p_values):
     return adjusted
 
 
-def _adjust_family(rows, method, family):
-    tested = [row for row in rows if row["p_value"] is not None]
+def _adjust_family(rows, method, family, missing_tests=0):
+    """Keep unavailable planned tests in the family without reporting imputed p-values."""
     adjusters = {"holm": _holm, "benjamini_hochberg": _benjamini_hochberg,
                  "none": lambda values: list(values)}
-    adjusted = adjusters[method]([row["p_value"] for row in tested])
-    for row, value in zip(tested, adjusted):
-        row["p_adjusted"] = value
+    p_values = [row["p_value"] if row["p_value"] is not None else 1.0 for row in rows]
+    adjusted = adjusters[method](p_values + [1.0] * missing_tests)
+    for row, value in zip(rows, adjusted):
+        row["p_adjusted"] = value if row["p_value"] is not None else None
     for row in rows:
         row["family"] = family
         row["adjustment"] = method
-        row["n_family"] = len(tested)
-    return len(tested)
+        row["n_family"] = len(rows) + missing_tests
+    return len(rows) + missing_tests
 
 
 def _apply_multiplicity(tables, prereg):
@@ -997,6 +1058,9 @@ def _apply_multiplicity(tables, prereg):
         for row in tables[name]:
             if row["metric"] in DERIVED_FROM_ALLOCATION:
                 row.update(family="derived_from_allocation", adjustment="none")
+                continue
+            if row["metric"] in REDUNDANT_CONTRAST_METRICS:
+                row.update(family="redundant_return_contrast", adjustment="none")
                 continue
             hits = [entry for entry in entries if entry["table"] == name and
                     entry["metric"] == row["metric"] and entry["contrast"] == row["contrast"] and
@@ -1016,7 +1080,16 @@ def _apply_multiplicity(tables, prereg):
                 primary.append(row)
             else:
                 exploratory.append(row)
-    n_primary = _adjust_family(primary, "holm", "primary")
+    planned = {}
+    for entry in entries:
+        count = len(matched[entry["id"]])
+        expected = entry.get("expected_tests")
+        if expected is not None and count > expected:
+            raise ValueError(f"Primary entry {entry['id']!r} matched {count} rows, exceeding "
+                             f"its expected_tests={expected}; check the registered filters")
+        planned[entry["id"]] = expected if expected is not None else max(1, count)
+    missing_primary = sum(planned[entry["id"]] - len(matched[entry["id"]]) for entry in entries)
+    n_primary = _adjust_family(primary, "holm", "primary", missing_primary)
     method = prereg["exploratory_adjustment"] if prereg else "benjamini_hochberg"
     n_exploratory = _adjust_family(exploratory, method, "exploratory")
     summary = {
@@ -1025,10 +1098,15 @@ def _apply_multiplicity(tables, prereg):
         "path": prereg["path"] if prereg else None,
         "primary_adjustment": "holm", "exploratory_adjustment": method,
         "entries": [{**entry, "n_rows_matched": len(matched[entry["id"]]),
+                     "n_planned_tests": planned[entry["id"]],
                      "n_tests_with_p_value": sum(1 for row in matched[entry["id"]] if row["p_value"] is not None)}
                     for entry in entries],
         "unmatched_primary": [entry["id"] for entry in entries if not matched[entry["id"]]],
         "n_primary_tests": n_primary, "n_exploratory_tests": n_exploratory,
+        "n_primary_tests_with_p_value": sum(row["p_value"] is not None for row in primary),
+        "n_unavailable_primary_tests": n_primary - sum(row["p_value"] is not None for row in primary),
+        "n_redundant_return_contrasts_excluded": sum(
+            row["metric"] in REDUNDANT_CONTRAST_METRICS for name in FAMILY_TABLES for row in tables[name]),
         "n_derived_from_allocation_excluded": sum(
             1 for name in FAMILY_TABLES for row in tables[name] if row["metric"] in DERIVED_FROM_ALLOCATION),
     }
@@ -1224,7 +1302,7 @@ def _design_summary(prepared):
 
 
 def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=None, prereg_path=None,
-            human_design="auto", participants_path=None):
+            human_design="auto", participants_path=None, return_tolerance_pp=None):
     """Write contrasts, interactions, validity/bounds/scenario diagnostics and adjusted inference.
 
     CIs are 95% scenario-cluster percentile intervals. Coverage denominators describe
@@ -1239,12 +1317,21 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
     if participants_path is not None and human_path is None:
         raise ValueError("participants_path requires human_path")
     prereg = _load_prereg(prereg_path) if prereg_path is not None else None
+    registered_tolerance = prereg.get("return_tolerance_pp") if prereg else None
+    if return_tolerance_pp is not None:
+        return_tolerance_pp = _return_tolerance(return_tolerance_pp)
+        if registered_tolerance is not None and return_tolerance_pp != registered_tolerance:
+            raise ValueError("return_tolerance_pp differs from the preregistered tolerance")
+    else:
+        return_tolerance_pp = (registered_tolerance if registered_tolerance is not None
+                               else DEFAULT_RETURN_TOLERANCE_PP)
     participants = _load_participants(participants_path) if participants_path is not None else None
     records = load_records(records_path)
     if any(isinstance(r, dict) and isinstance(r.get("result"), dict) and
            r["result"].get("provider") == "human" for r in records):
         raise ValueError("Model records must not contain human providers; use human_path")
-    model = _prepare(records, "model")
+    model = _prepare(records, "model", return_tolerance_pp)
+    return_levels = _return_claim_levels(model)
     contrasts = _select_contrasts(model["candidates"])
     model_sets = _contrast_sets(model["buckets"], contrasts, "model", model["exclusions"])
     effects = _effects(model, model_sets, contrasts, bootstrap, seed)
@@ -1267,7 +1354,8 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
         if any(not isinstance(r, dict) or not isinstance(r.get("result"), dict) or
                r["result"].get("provider") != "human" for r in human_records):
             raise ValueError("human_path must contain imported human result records only")
-        human = _prepare(human_records, "human")
+        human = _prepare(human_records, "human", return_tolerance_pp)
+        return_levels.extend(_return_claim_levels(human))
         # A subject/trial observation may appear only once even if a caller relabels
         # its human provider model/version/generation metadata.
         identifiers = [(r["result"].get("subject_id"), r["trial"].get("trial_id"))
@@ -1305,10 +1393,16 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
         warnings.update(summary["warnings"])
     if exclusions:
         warnings.add("Exclusions are explicit; consult exclusions and pair_coverage before interpreting complete-case effects.")
+    if any(row["ci_unavailable_reason"] == "requires_two_subjects_per_arm_stratum" for row in comparisons):
+        warnings.add("Human comparison intervals require at least two independent subjects in every "
+                     "observed arm-membership stratum; singleton strata retain point estimates only.")
     tables_for_inference = {"effects": effects, **interaction_tables}
     preregistration = _apply_multiplicity(tables_for_inference, prereg)
     if preregistration["unmatched_primary"]:
         warnings.add(f"PREREGISTRATION: primary entries matched no analysis row: {', '.join(preregistration['unmatched_primary'])}")
+    if preregistration["n_unavailable_primary_tests"]:
+        warnings.add(f"PREREGISTRATION: {preregistration['n_unavailable_primary_tests']} primary test(s) "
+                     "have no p-value; they remain in the Holm family as non-rejections.")
     status_totals = []
     for source, denominator in record_totals.items():
         counts = Counter()
@@ -1322,6 +1416,7 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
                                   "fraction": counts[status] / denominator if denominator else None})
     report = {
         "schema_version": 2, "bootstrap": bootstrap, "seed": seed, "confidence_level": .95,
+        "return_tolerance_pp": return_tolerance_pp, "return_claim_levels": return_levels,
         "contrasts": contrasts, "primary_contrast": PRIMARY_CONTRAST, "human_design": resolved_design,
         "effects": effects, **interaction_tables, "validity_effects": validity,
         "bounds_effects": bounds, "scenario_robustness": scenario_robustness,
@@ -1334,18 +1429,20 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
         "warnings": sorted(warnings),
         "methods": {
             "claim": "Estimates describe calendar-cue sensitivity: the change in a particular model's (or human sample's) answers when specified prompt text changes, under the stated inference conditions. They do not measure beliefs, and they do not identify mediating mechanisms or causal pathways inside the model.",
-            "contrasts": "A_minus_B over matched conditions of the same pair. event_minus_neutral is the primary contrast (cue sensitivity). event_minus_no_calendar compares with a prompt carrying no calendar mention. event_minus_occasion_control separates auspiciousness from general occasion salience. event_minus_purchase_control separates it from a gold/purchase association without a festival. neutral_minus_no_calendar shows the effect of merely stating an ordinary day. persona_interactions (observant vs nonobservant) address preference accommodation; cue_interactions compare cue wording; language_interactions compare each language with English on matched tasks (wording and language remain confounded unless templates are independently reviewed). return_claim_deviation_pp = expected_return_pct minus the supplied gold expected return (contradicting a supplied assumption). reserve_shortfall_pct and reserve_violation measure failing a defined requirement (the stated liquidity reserve held entirely in cash).",
+            "contrasts": "A_minus_B over matched conditions of the same pair. event_minus_neutral is the primary contrast (cue sensitivity). Other contrasts compare the specified occasion, purchase and no-calendar controls. Persona interactions address preference accommodation; cue interactions compare wording; language interactions compare matched tasks with English, with wording and language still confounded unless independently reviewed. Absolute return error and return_claim_violation measure disagreement with a supplied assumption. The signed return-deviation contrast duplicates expected_return_pct and is diagnostic only. Reserve metrics measure failure of the stated cash-only reserve requirement.",
             "estimand": "Mean scenario-level A-minus-B complete-pair difference; average repetitions (paraphrases, templates, replicates) within subject/scenario, then subjects within scenario, then scenarios equally. Complete-case is applied per contrast (both trials ok).",
-            "derived_metrics": "return_claim_deviation_pp = expected_return_pct - economics.gold_expected_annual_pct; reserve_shortfall_pct = max(0, 100*liquidity_need_inr/capital_inr - cash_pct); reserve_violation = 1 if shortfall > 0.01 else 0; wtp_premium_pct = 100*(willingness_to_pay_inr - gold_unit_price_inr)/gold_unit_price_inr. cash_pct equals 100 - gold_pct - equity_pct, is flagged derived_from_allocation and excluded from multiplicity families; buy_now is tied to timing_days and the reserve metrics to cash_pct, so related rows are not independent confirmations.",
+            "derived_metrics": "Signed return deviation = expected_return_pct - supplied gold return; return_claim_absolute_error_pp is its absolute value; return_claim_violation is 1 when absolute error exceeds report.return_tolerance_pp, allowing numerical rounding of 1e-12 at the boundary. Reserve shortfall = max(0, 100*liquidity_need_inr/capital_inr - cash_pct), with reserve_violation = 1 above 0.01 pp. wtp_premium_pct benchmarks against the quoted unit price. cash_pct and the signed return-deviation contrast are excluded from multiplicity families as redundant; related outcomes are not independent confirmations.",
+            "return_claim_levels": "Per-condition signed return deviation, absolute error and violation rate among valid responses in structurally accepted buckets. Average repetitions within subject/scenario, subjects within scenario, and scenarios equally. These descriptive levels expose errors shared by both arms; they are not additional hypothesis tests. The tolerance is loaded from preregistration when declared, otherwise defaults to 0.01 pp or an explicit exploratory override; conflicting registered and command-line values are rejected.",
             "missingness": "No imputation in effects; pair coverage uses observed pair IDs only. Grouped missingness covers attributable records; record_status_totals includes unstratifiable malformed records. Trials entirely absent from result files are not identifiable and cannot be bounded.",
             "validity_effects": "P(status ok) for condition A minus condition B over ALL attempted pairs (both trials have a record, whatever the status), averaged within scenario then across scenarios; plus valid-rate and status breakdowns by language, festival, cue, role, persona and condition. Complete-case effects describe the surviving subset of tasks, not all attempted tasks.",
-            "bounds_effects": "Worst-case (Manski-type) bounds of the cluster-averaged contrast over all attempted pairs, imputing every non-ok side with the lowest or highest value of the metric's support (gold/equity/cash 0-100, buy_now and reserve_violation 0-1, timing_days 0..max_delay_days, reserve_shortfall_pct 0..max(100, 100*liquidity/capital)). Unbounded metrics are listed with skipped_reason. Pairs structurally rejected or entirely absent are not part of the bounds.",
+            "bounds_effects": "Worst-case (Manski-type) bounds over attempted pairs: allocations 0-100; buy_now, reserve_violation and return_claim_violation 0-1; timing_days 0..max_delay_days; reserve_shortfall_pct 0..max(100, 100*liquidity/capital). Unbounded metrics, including absolute return error, are listed with skipped_reason. Structurally rejected or entirely absent pairs are excluded.",
             "scenario_robustness": "scenario_effects.csv holds each scenario's own contrast estimate; scenario_robustness reports n_scenarios, the share of scenarios whose sign equals the pooled sign, and min/max. template_effects.csv gives per-template estimates when more than one template is present. Main tables pool paraphrase/template/replicate within scenario. With fewer than 8 scenarios intervals describe only the sampled scenarios.",
             "effects_ci": "Resample scenarios with replacement (one resample shared by all metrics of a group/contrast); no independent-generation or paraphrase pseudoreplication. Human-only effects CIs condition on the observed subjects.",
-            "inference": "p_value is a two-sided add-one bootstrap p: min(1, 2*min(#(b<=0)+1, #(b>=0)+1)/(B+1)) over the scenario bootstrap draws. Without a preregistration file every row is exploratory and Benjamini-Hochberg adjusted across all non-derived rows of the effects and interaction tables. With a preregistration, rows matching a primary entry form the primary family (Holm across that family only), flagged exceeds_mme (CI entirely beyond +-minimum_meaningful_effect) or within_mme (CI entirely inside); all other rows are exploratory and adjusted with the preregistered exploratory method. Rows without a bootstrap interval have no p-value. Unadjusted 95% percentile CIs; no causal identification from observational human/market data. A preregistration file alone does not specify hypotheses, exclusions or stopping rules beyond what it contains.",
+            "inference": "Two-sided add-one bootstrap p = min(1, 2*min(#(b<=0)+1, #(b>=0)+1)/(B+1)). Nonredundant effects/interactions are exploratory and BH-adjusted unless registered as primary. Primary rows use Holm; expected_tests fixes an entry's planned row count, including absent strata. Unavailable tests stay in the family as internal p=1 non-rejections, while reported p-values remain unavailable. Entries without an explicit count reserve matched rows or at least one test if unmatched. Excess matches are an error; unmatched entries also produce an error after outputs are written. Planned primary tests and available p-values are counted separately. MME flags use unadjusted 95% percentile intervals, not multiplicity-adjusted intervals. Register hypotheses, exclusions and stopping rules prospectively.",
             "language_interactions": "Subtract reference-level (English / nonobservant / festival_named) paired effects only on identical matched task dimensions and subjects, then resample shared scenarios; persona_interactions and cue_interactions use the same rule on their dimension.",
             "human_comparison": "Event_minus_neutral only. Exact trial IDs and task/role metadata required. 'within': each subject supplied both conditions of a pair; matched complete-case model-minus-human paired effects with crossed subject x scenario bootstrap. 'unpaired': each human response comes from a subject who saw one trial of the pair; per pair, human effect = mean of event responses minus mean of (different subjects') neutral responses (needs >=1 ok response on each side); the comparison is model pair effect minus human pair effect on identical pairs, averaged within scenario then across scenarios; the bootstrap resamples scenarios and subjects (within strata defined by the arm(s) each subject appeared in) and counts bootstrap_valid_draws; draws leaving no pair are omitted. Sparse designs can yield empty draws. Subject/scenario selection and shared-task dependence limit population generalization.",
             "participants": "Optional self-reported covariates (survey language, language proficiency, researcher-defined financial literacy score, observance). human_heterogeneity.csv splits the human event_minus_neutral effect (same estimator as the chosen design) by observance (>=4 vs <=2, middle excluded and counted) and by financial literacy (<= vs > the sample median of subjects with responses); it is descriptive and is never used to adjust the model comparison. Subjects absent from the participants file are listed in exclusions.",
+            "human_unpaired_interval_eligibility": "The crossed unpaired bootstrap requires at least two scenarios and at least two independent subjects in every observed arm-membership stratum (event-only, neutral-only or counterbalanced). A singleton stratum retains the point estimate but has no population interval and reports requires_two_subjects_per_arm_stratum. Empty resamples remain counted and are omitted.",
             "model_identity": "Provider, requested model, returned model version and generation settings are separate strata; unresolved versions cannot prove cross-run checkpoint identity.",
             "units": UNITS,
         },
@@ -1364,6 +1461,8 @@ def analyze(records_path, output_dir, *, bootstrap=2000, seed=42, human_path=Non
         "scenario_effects": (scenario_effects, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "cluster_id", "estimate", "n_pairs")),
         "scenario_robustness": (scenario_robustness, (*GROUP_FIELDS, "source", "metric", "unit", "contrast", "n_scenarios", "pooled_estimate", "share_same_sign", "min_scenario_estimate", "max_scenario_estimate")),
         "template_effects": (template_effects, (*GROUP_FIELDS, "source", "template_id", "metric", "unit", "contrast", "estimate", "ci_low", "ci_high", "n_pairs", "n_clusters", "ci_method", "ci_unavailable_reason")),
+        "return_claim_levels": (return_levels, (*GROUP_FIELDS, "source", "condition", "metric", "unit",
+                                               "estimate", "n_records", "n_clusters", "n_subjects")),
         "human_comparisons": (comparisons, (*GROUP_FIELDS, "metric", "unit", "contrast", "human_design", "estimate", "ci_low", "ci_high", "matched_model_pairs", "matched_human_units", "n_clusters", "n_subjects", "bootstrap_valid_draws", "ci_method", "ci_unavailable_reason", "unmatched_model_pairs")),
         "human_participants": (human_participant_rows, ("survey_language", "n_participants", "n_with_responses", "language_proficiency_mean", "language_proficiency_min", "language_proficiency_max", "financial_literacy_mean", "financial_literacy_median", "financial_literacy_min", "financial_literacy_max", "observance_mean", "observance_high_n", "observance_middle_n", "observance_low_n")),
         "human_heterogeneity": (heterogeneity, ("covariate", "level", "survey_language", "split_rule", "split_value", "metric", "unit", "contrast", "human_design", "estimate", "ci_low", "ci_high", "n_subjects_in_split", "n_subjects_contributing", "n_pairs", "n_clusters", "n_middle_excluded", "ci_method", "ci_unavailable_reason")),

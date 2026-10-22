@@ -205,6 +205,45 @@ class CapabilityDataTests(unittest.TestCase):
         self.assertTrue(ow._answer_correct(0.005, 0))
         self.assertFalse(ow._answer_correct(0.02, 0))
 
+    def test_capability_cache_binds_content_path_limit_and_provider(self):
+        class Fake:
+            identity = {"provider": "fake", "generation": {"strength": 0.0}}
+
+            def generate_text(self, prompt, key=None):
+                return {"status": "ok", "raw_text": '{"answer": 0}'}
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            items, target = root / "items.json", root / "report.json"
+            items.write_text(json.dumps(self.data), encoding="utf-8")
+            provider = Fake()
+            with patch.object(ow, "capability_check", wraps=ow.capability_check) as run:
+                original = ow._capability_report(target, provider, items_path=items, limit=1)
+                before = target.read_bytes()
+                ow._capability_report(target, provider, items_path=items, limit=1)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(target.read_bytes(), before)
+                self.data["languages"]["en"]["instruction"] += " Updated question wording."
+                items.write_text(json.dumps(self.data), encoding="utf-8")
+                updated = ow._capability_report(target, provider, items_path=items, limit=1)
+                self.assertEqual(run.call_count, 2)
+                self.assertNotEqual(updated["items_sha256"], original["items_sha256"])
+                alternate = root / "alternate.json"
+                alternate.write_bytes(items.read_bytes())
+                moved = ow._capability_report(target, provider, items_path=alternate, limit=1)
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(moved["items_path"], str(alternate))
+                ow._capability_report(target, provider, items_path=alternate, limit=2)
+                self.assertEqual(run.call_count, 4)
+                provider.identity = {"provider": "fake", "generation": {"strength": 1.0}}
+                ow._capability_report(target, provider, items_path=alternate, limit=2)
+                self.assertEqual(run.call_count, 5)
+                del self.data["status"]
+                alternate.write_text(json.dumps(self.data), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "DRAFT"):
+                    ow._capability_report(target, provider, items_path=alternate, limit=2)
+                self.assertEqual(run.call_count, 5)
+
     def test_capability_report_with_known_replies(self):
         gold = {(language, ow._capability_prompt(self.data, language, item)): item["answer"]
                 for language in self.data["languages"] for item in self.data["items"]}
@@ -852,6 +891,25 @@ class RealDecoderTests(unittest.TestCase):
         self.assertTrue(all(info["reused"] for info in again["probes"].values()))
         self.assertEqual(before, {path.relative_to(out).as_posix(): path.read_bytes() for path in out.rglob("*.npz")})
         self.assertEqual(capability_bytes, (out / "L1" / "all" / "s1" / "capability_check.json").read_bytes())
+        self._assert_no_hooks()
+
+    def test_steering_grid_refreshes_capability_after_item_changes(self):
+        source, _ = self._grid_corpus()
+        out, items = self.root / "grid", self.root / "items.json"
+        data, _, _ = ow._load_capability(None)
+        items.write_text(json.dumps(data), encoding="utf-8")
+        kwargs = dict(model="local-fixture", layers=[0], strengths=[1.0], max_output_tokens=1,
+                      capability_items_path=str(items), capability_limit=1)
+        ow.steering_grid(source, out, **kwargs)
+        report_path = out / "L0" / "baseline" / "capability_check.json"
+        first = json.loads(report_path.read_text())
+        data["languages"]["en"]["instruction"] += " Updated capability task."
+        items.write_text(json.dumps(data), encoding="utf-8")
+        resumed = ow.steering_grid(source, out, **kwargs)
+        refreshed = json.loads(report_path.read_text())
+        self.assertNotEqual(first["items_sha256"], refreshed["items_sha256"])
+        self.assertEqual(refreshed["items_sha256"], hashlib.sha256(items.read_bytes()).hexdigest())
+        self.assertTrue(all(run["executed"] == 0 for run in resumed["runs"]))
         self._assert_no_hooks()
 
     def test_steering_grid_rejects_bad_inputs_before_loading_a_model(self):
