@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "data_path": "../data/stimuli.json",
+  "mode": "exploratory",
+  "seed": 42,
+  "languages": ["en", "hi", "ta", "gu", "bn"],
+  "festivals": ["dhanteras", "akshaya_tritiya", "muhurat", "pitru_paksha"],
+  "roles": ["investor", "advisor"],
+  "personas": ["unspecified"],
+  "scenarios": ["emergency_buffer"],
+  "paraphrases": ["direct"],
+  "cues": ["festival_named"],
+  "replicates": 1
+}

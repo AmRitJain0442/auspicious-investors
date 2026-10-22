@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auspicious-investors"
+version = "0.1.0"
+description = "Auditable multilingual calendar-belief investment experiments"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+openweights = ["numpy>=1.26", "torch>=2.2", "transformers>=4.45,<5", "safetensors>=0.4"]
+
+[project.scripts]
+auspicious = "auspicious.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["auspicious*"]
