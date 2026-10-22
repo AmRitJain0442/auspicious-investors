@@ -995,6 +995,19 @@ def _read_json_file(path):
         return None
 
 
+def _capability_report(output_path, provider, *, items_path=None, limit=None):
+    """Reuse scores only for unchanged, currently valid capability materials and settings."""
+    _data, items_sha256, resolved_path = _load_capability(items_path)
+    current = _read_json_file(output_path)
+    expected_identity = json.loads(json.dumps(provider.identity))
+    if (current is not None and current.get("kind") == "capability_check"
+            and current.get("provider_identity") == expected_identity
+            and current.get("limit") == limit and current.get("items_sha256") == items_sha256
+            and current.get("items_path") == resolved_path):
+        return current
+    return capability_check(output_path, provider, items_path=resolved_path, limit=limit)
+
+
 def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu", layers, strengths,
                   positions=("all",), random_seeds=(), temperature=0.0, max_output_tokens=512, seed=42,
                   ridge=1.0, limit=None, capability=True, capability_items_path=None, capability_limit=None):
@@ -1125,12 +1138,8 @@ def steering_grid(trials_path, output_dir, *, model, revision=None, device="cpu"
                "counts": summary["counts"], "capability": None}
         if capability:
             target = Path(run_dir) / "capability_check.json"
-            current = _read_json_file(target)
-            expected_identity = json.loads(json.dumps(provider.identity))
-            if (current is None or current.get("provider_identity") != expected_identity
-                    or current.get("limit") != capability_limit):
-                current = capability_check(target, provider, items_path=capability_items_path,
-                                           limit=capability_limit)
+            current = _capability_report(target, provider, items_path=capability_items_path,
+                                         limit=capability_limit)
             row["capability"] = {"path": str(target), "overall": current["overall"],
                                  "per_language": current["per_language"]}
         runs.append(row)

@@ -280,6 +280,36 @@ class StimuliTests(unittest.TestCase):
         _, edited = self.build()
         self.assertFalse({r["trial_id"] for r in changed} & {r["trial_id"] for r in edited})
 
+    def test_cached_context_rejects_in_place_approval_and_material_mutations(self):
+        self.small_controls()
+        self.config["mode"] = "confirmatory"
+        self.approve()
+        _, rows = self.build()
+        for mutation in ("approval", "material", "schema"):
+            with self.subTest(mutation=mutation):
+                context = load_review_context(self.output_path)
+                validate_trials(rows, confirmatory=True, review_context=context)
+                if mutation == "approval":
+                    context["manifest"]["subjects"][0]["decision"] = "rejected"
+                elif mutation == "material":
+                    context["materials"]["language:en:t1"]["introduction"] += " unreviewed edit"
+                else:
+                    context["schema_version"] = -1
+                with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                    validate_trials(rows, confirmatory=True, review_context=context)
+
+    def test_cached_context_rechecks_approvals_after_a_recomputed_content_hash(self):
+        self.small_controls()
+        self.config["mode"] = "confirmatory"
+        self.approve()
+        _, rows = self.build()
+        context = load_review_context(self.output_path)
+        validate_trials(rows, confirmatory=True, review_context=context)
+        context["manifest"]["subjects"][0]["decision"] = "rejected"
+        context["context_sha256"] = _hash({"materials": context["materials"], "manifest": context["manifest"]})
+        with self.assertRaisesRegex(ValueError, "approval"):
+            validate_trials(rows, confirmatory=True, review_context=context)
+
     def test_confirmatory_requires_hash_bound_approval(self):
         self.small_controls()
         self.config["mode"] = "confirmatory"

@@ -114,13 +114,25 @@ recorded as `invalid`, never repaired.
 | Question | Outcome | Definition |
 |---|---|---|
 | Did the allocation/timing change? | `gold_pct`, `equity_pct`, `buy_now`, `timing_days` | event − comparison, within pair |
-| Did the model contradict a supplied assumption? | `return_claim_deviation_pp` | `expected_return_pct − stated gold expected return` |
+| Did the model contradict a supplied assumption? | `return_claim_absolute_error_pp`, `return_claim_violation` | Absolute error against the stated gold return; violation if it exceeds the registered tolerance |
 | Did the plan fail a defined requirement? | `reserve_shortfall_pct`, `reserve_violation` | The prompt requires the liquid reserve to be held **entirely in cash**; shortfall = `max(0, 100·reserve/capital − cash_pct)`; violation if > 0.01 pp |
 | (valuation) | `wtp_premium_pct` | `100·(willingness_to_pay − unit price)/unit price` |
 
 `cash_pct` is determined by gold and equity: it is reported but flagged
 `derived_from_allocation` and excluded from multiplicity families, and `buy_now` is tied to
 `timing_days`. These are not independent confirmations of one finding.
+
+`return_claim_levels.csv` reports the signed deviation, absolute error, and violation rate in
+each condition, averaging repetitions within subject/scenario, subjects within scenario, and
+scenarios equally. It uses valid responses from structurally accepted tasks. Thus an incorrect
+10% return in both arms remains visible even when the event-minus-neutral difference is zero.
+The signed `return_claim_deviation_pp` contrast is retained for compatibility, but it duplicates
+`expected_return_pct` and is excluded from multiplicity families and primary hypotheses.
+
+The return-error tolerance defaults to **0.01 percentage points**, with a small numerical
+rounding tolerance at the boundary. Set `return_tolerance_pp` in the preregistration before
+collection, or use `analyze --return-tolerance-pp` for exploratory analysis. Analysis records the
+effective tolerance and rejects a command-line override that differs from the registered value.
 
 ### What each contrast separates
 
@@ -133,7 +145,7 @@ recorded as `invalid`, never repaired.
 | `event_minus_purchase_control` | Auspiciousness vs. gold/purchase association |
 | persona interactions (observant − nonobservant) | Preference accommodation |
 | cue interactions (`explicit_belief` − `festival_named`) | Effect of stating the belief |
-| `return_claim_deviation_pp`, `reserve_violation` effects | Unsupported return claims; violated constraints |
+| `return_claim_absolute_error_pp`, `return_claim_violation`, `reserve_violation` effects | Changes in return errors and violations of defined requirements |
 
 Language interactions are against English on **identical** matched tasks.
 
@@ -169,6 +181,13 @@ Written to `--out`: `analysis.json` plus CSVs — `effects`, `language_interacti
   against the stated minimum meaningful effect; unmatched primary entries are reported loudly.
   The report records the prereg file's SHA-256 and the number of exploratory tests (the full
   design yields on the order of 10³ metric-level estimates).
+- **Planned test counts.** Unavailable p-values remain in the adjustment family as conservative
+  non-rejections; their reported p-values stay unavailable. Use `expected_tests` on each primary
+  entry to register how many rows its filters should select, including strata that might be
+  entirely missing. Fewer observed rows retain that planned family size; extra rows are an error.
+  Without an explicit count, matched rows count individually and an unmatched entry reserves at
+  least one test before analysis reports the missing entry as an error. The report separates
+  planned primary tests from tests with available p-values.
 - **Preregistration is separate from the hash-bound review workflow.** Review hashes protect the
   *materials*; a statistical preregistration must additionally fix hypotheses, exclusions, stopping
   rules and analysis decisions.
@@ -192,6 +211,8 @@ Review materials live **once per corpus** in `<trials>.review.json` (each trial 
 `context_sha256`). Confirmatory runs reject: draft status, a missing or tampered sidecar, content or
 approval hash mismatches, prompt edits, any subset of the reviewed design, and `--limit`. Approvals
 are attributable attestations, not cryptographic identity verification.
+Reusing a loaded review context rechecks its content hash, including nested material and approval
+changes; sharing the same Python object does not bypass integrity checks.
 
 ---
 
@@ -230,6 +251,12 @@ used for descriptive heterogeneity only. Invalid answers stay invalid; nothing i
 `examples/human-format.csv` and `examples/participants-format.csv` are header-only. Even a clean
 comparison concerns these hypothetical tasks, not real investing; get ethics approval and
 document recruitment before collecting data.
+
+The unpaired model-human comparison reports participant-population intervals only when every
+observed arm-membership stratum has at least two independent participants and there are at least
+two scenarios. A singleton stratum leaves the point estimate available but returns no interval,
+with `ci_unavailable_reason=requires_two_subjects_per_arm_stratum`. This is a minimum eligibility
+check, not a claim that two participants provide adequate power.
 
 Contextual market series (`auspicious context --csv …`, columns `date,series,value,unit,source,event`)
 remain descriptive and are never pooled with allocations.
@@ -281,6 +308,9 @@ layer, norm-matched random directions, and a capability check per cell. Compare 
 baseline, random directions, validity rate, and capability; the analysis step keeps steered runs in
 separate strata (steering settings are part of the generation identity). `data/capability.json` is
 draft, AI-authored arithmetic items.
+Resumed capability checks reuse scores only when the currently validated item-file content hash,
+item path, item limit, and provider identity all match. Editing or switching the questions refreshes
+the capability report while completed investment trials remain resumable.
 
 A steering vector that moves outputs shows a causally effective direction in the tested setting. It
 does **not** show that the direction mediates the original date effect or is specific to

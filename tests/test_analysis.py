@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from auspicious.analysis import (
-    CONTEXT_FIELDS, HUMAN_FIELDS, _benjamini_hochberg, _holm, analyze, contextual_series,
+    CONTEXT_FIELDS, HUMAN_FIELDS, _adjust_family, _benjamini_hochberg, _holm, analyze, contextual_series,
     import_humans, import_participants,
 )
 from auspicious.core import write_jsonl
@@ -276,7 +276,8 @@ class AnalysisTests(unittest.TestCase):
         report = self.run_analysis([])
         self.assertEqual(report["effects"], [])
         for name in ("effects", "human_comparisons", "missingness", "exclusions", "validity_effects",
-                     "bounds_effects", "scenario_effects", "template_effects", "human_heterogeneity"):
+                     "bounds_effects", "scenario_effects", "template_effects", "human_heterogeneity",
+                     "return_claim_levels"):
             self.assertEqual(len((self.root / "analysis" / f"{name}.csv").read_text().splitlines()), 1, name)
 
     # ----- contrasts and derived metrics -----
@@ -337,6 +338,62 @@ class AnalysisTests(unittest.TestCase):
         far = payload(gold=10, equity=40.02)    # cash 49.98 -> shortfall .02 (violation)
         report = self.run_analysis(pair(answers={"event": far, "neutral": near}))
         self.assertEqual(self.row(report, "reserve_violation")["estimate"], 1)
+
+    def test_equal_wrong_return_claims_remain_visible_in_condition_levels(self):
+        wrong = payload(expected=10)
+        report = self.run_analysis(pair(answers={"event": wrong, "neutral": wrong}))
+        self.assertEqual(self.row(report, "return_claim_deviation_pp")["estimate"], 0)
+        levels = {(r["condition"], r["metric"]): r for r in report["return_claim_levels"]}
+        for condition in ("event", "neutral"):
+            self.assertEqual(levels[condition, "return_claim_deviation_pp"]["estimate"], 6)
+            self.assertEqual(levels[condition, "return_claim_absolute_error_pp"]["estimate"], 6)
+            self.assertEqual(levels[condition, "return_claim_violation"]["estimate"], 1)
+        self.assertEqual(len(self.read_csv("return_claim_levels")), 6)
+        signed = self.row(report, "return_claim_deviation_pp")
+        self.assertEqual(signed["family"], "redundant_return_contrast")
+        self.assertIsNone(signed["p_adjusted"])
+
+    def test_return_error_contrast_distinguishes_correction_from_violation(self):
+        report = self.run_analysis(pair(answers={"event": payload(expected=4), "neutral": payload(expected=10)}))
+        self.assertEqual(self.row(report, "return_claim_absolute_error_pp")["estimate"], -6)
+        self.assertEqual(self.row(report, "return_claim_violation")["estimate"], -1)
+
+    def test_return_condition_levels_weight_scenarios_equally_and_exclude_rejected_records(self):
+        records = (pair("s1", answers={"event": payload(expected=10)}) +
+                   pair("s1", replicate=1, answers={"event": payload(expected=10)}) +
+                   pair("s2", answers={"event": payload(expected=4)}))
+        duplicate = pair("s3", answers={"event": payload(expected=90)})
+        records += duplicate + [copy.deepcopy(duplicate[0])]
+        report = self.run_analysis(records)
+        event = next(r for r in report["return_claim_levels"]
+                     if r["condition"] == "event" and r["metric"] == "return_claim_absolute_error_pp")
+        self.assertEqual((event["estimate"], event["n_records"], event["n_clusters"]), (3, 3, 2))
+
+    def test_return_tolerance_is_registered_validated_and_cannot_be_overridden(self):
+        prereg = self.write_prereg({"schema_version": 1, "return_tolerance_pp": 0.5,
+            "primary": [{"id": "return_error", "table": "effects", "metric": "return_claim_violation",
+                         "contrast": "event_minus_neutral", "minimum_meaningful_effect": 0.1}]})
+        records = pair(answers={"event": payload(expected=4.5), "neutral": payload(expected=3.49)})
+        report = self.run_analysis(records, prereg_path=prereg)
+        self.assertEqual(report["return_tolerance_pp"], 0.5)
+        self.assertEqual(self.row(report, "return_claim_violation")["estimate"], -1)
+        with self.assertRaisesRegex(ValueError, "preregistered tolerance"):
+            self.run_analysis(records, prereg_path=prereg, return_tolerance_pp=0.1)
+        for invalid in (-1, float("nan"), float("inf"), True, "0.1"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "return_tolerance_pp"):
+                self.run_analysis(records, return_tolerance_pp=invalid)
+        exact = self.run_analysis(pair(answers={"event": payload(expected=4), "neutral": payload(expected=4.01)}))
+        self.assertEqual(self.row(exact, "return_claim_violation")["estimate"], 0)
+
+    def test_cli_passes_return_tolerance_to_analysis(self):
+        from auspicious.cli import dispatch, parser
+        path = self.root / "cli-records.jsonl"
+        write_jsonl(path, pair(answers={"event": payload(expected=4.2), "neutral": payload(expected=4)}))
+        args = parser().parse_args(["analyze", "--records", str(path), "--out", str(self.root / "cli-analysis"),
+                                    "--bootstrap", "0", "--return-tolerance-pp", "0.25"])
+        report = dispatch(args)
+        self.assertEqual(report["return_tolerance_pp"], 0.25)
+        self.assertEqual(self.row(report, "return_claim_violation")["estimate"], 0)
 
     # ----- interactions -----
 
@@ -476,9 +533,9 @@ class AnalysisTests(unittest.TestCase):
         gold = self.gold(report)
         self.assertEqual(gold["p_value"], 2 / 101)  # every draw is 10: add-one p = 2/(B+1)
         self.assertEqual(self.row(report, "equity_pct")["p_value"], 1.0)  # every draw exactly 0
-        self.assertEqual((gold["family"], gold["adjustment"], gold["n_family"]), ("exploratory", "benjamini_hochberg", 10))
-        # p-values: gold and reserve_shortfall 2/101, the other eight 1; BH m=10 -> 10/101
-        self.assertAlmostEqual(gold["p_adjusted"], 10 / 101)
+        self.assertEqual((gold["family"], gold["adjustment"], gold["n_family"]), ("exploratory", "benjamini_hochberg", 11))
+        # Gold and reserve_shortfall have p=2/101; nine other nonredundant metrics have p=1.
+        self.assertAlmostEqual(gold["p_adjusted"], 11 / 101)
         cash = self.row(report, "cash_pct")
         self.assertTrue(cash["derived_from_allocation"])
         self.assertEqual(cash["family"], "derived_from_allocation")
@@ -486,7 +543,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(gold["derived_from_allocation"])
         self.assertIsNone(gold["exceeds_mme"])
         self.assertEqual(report["preregistration"]["provided"], False)
-        self.assertEqual(report["preregistration"]["n_exploratory_tests"], 10)
+        self.assertEqual(report["preregistration"]["n_exploratory_tests"], 11)
 
     def test_prereg_primary_family_uses_holm_and_flags_mme(self):
         prereg = self.write_prereg({
@@ -509,11 +566,45 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(h2["within_mme"])  # CI [0, 0] lies inside +-5
         self.assertFalse(h2["exceeds_mme"])
         other = self.row(report, "buy_now")
-        self.assertEqual((other["family"], other["adjustment"], other["n_family"]), ("exploratory", "holm", 8))
+        self.assertEqual((other["family"], other["adjustment"], other["n_family"]), ("exploratory", "holm", 9))
         summary = report["preregistration"]
         self.assertEqual(summary["sha256"], hashlib.sha256(prereg.read_bytes()).hexdigest())
-        self.assertEqual((summary["n_primary_tests"], summary["n_exploratory_tests"]), (2, 8))
+        self.assertEqual((summary["n_primary_tests"], summary["n_exploratory_tests"]), (2, 9))
         self.assertEqual(summary["unmatched_primary"], [])
+
+    def test_holm_keeps_untestable_rows_in_the_family(self):
+        rows = [{"p_value": 0.03}, {"p_value": None}]
+        self.assertEqual(_adjust_family(rows, "holm", "primary"), 2)
+        self.assertEqual(rows[0]["p_adjusted"], 0.06)
+        self.assertEqual([row["n_family"] for row in rows], [2, 2])
+        self.assertIsNone(rows[1]["p_value"])
+        self.assertIsNone(rows[1]["p_adjusted"])
+
+    def test_primary_family_keeps_rows_without_enough_scenarios(self):
+        prereg = self.write_prereg({"schema_version": 1, "primary": [{
+            "id": "gold", "table": "effects", "metric": "gold_pct", "contrast": "event_minus_neutral",
+            "minimum_meaningful_effect": 2, "expected_tests": 2}]})
+        records = pair("s1") + pair("s2") + pair("s1", role="advisor")
+        report = self.run_analysis(records, prereg_path=prereg)
+        available = self.gold(report, role="investor")
+        unavailable = self.gold(report, role="advisor")
+        self.assertAlmostEqual(available["p_adjusted"], 4 / 101)
+        self.assertEqual(unavailable["n_family"], 2)
+        self.assertIsNone(unavailable["p_adjusted"])
+        self.assertEqual(report["preregistration"]["n_unavailable_primary_tests"], 1)
+
+    def test_expected_primary_tests_preserve_completely_absent_strata(self):
+        document = {"schema_version": 1, "primary": [{
+            "id": "gold", "table": "effects", "metric": "gold_pct", "contrast": "event_minus_neutral",
+            "minimum_meaningful_effect": 2, "expected_tests": 2}]}
+        report = self.run_analysis(pair("s1") + pair("s2"), prereg_path=self.write_prereg(document))
+        self.assertEqual(self.gold(report)["n_family"], 2)
+        self.assertAlmostEqual(self.gold(report)["p_adjusted"], 4 / 101)
+        self.assertEqual(report["preregistration"]["entries"][0]["n_planned_tests"], 2)
+        document["primary"][0]["expected_tests"] = 1
+        with self.assertRaisesRegex(ValueError, "exceeding its expected_tests"):
+            self.run_analysis(pair("s1") + pair("s1", role="advisor"),
+                              prereg_path=self.write_prereg(document))
 
     def test_prereg_unmatched_primary_is_loud_but_outputs_remain(self):
         prereg = self.write_prereg({
@@ -536,6 +627,11 @@ class AnalysisTests(unittest.TestCase):
             {"schema_version": 1, "primary": [{**good, "table": "human_comparisons"}]},
             {"schema_version": 1, "primary": [{**good, "metric": "nonsense"}]},
             {"schema_version": 1, "primary": [{**good, "metric": "cash_pct"}]},
+            {"schema_version": 1, "primary": [{**good, "metric": "return_claim_deviation_pp"}]},
+            {"schema_version": 1, "primary": [{**good, "expected_tests": 0}]},
+            {"schema_version": 1, "primary": [{**good, "expected_tests": True}]},
+            {"schema_version": 1, "primary": [{**good, "expected_tests": None}]},
+            {"schema_version": 1, "primary": [good], "return_tolerance_pp": -1},
             {"schema_version": 1, "primary": [{**good, "contrast": "event_minus_other"}]},
             {"schema_version": 1, "primary": [{**good, "filters": {"nonsense": "x"}}]},
             {"schema_version": 1, "primary": [{**good, "minimum_meaningful_effect": 0}]},
@@ -622,6 +718,45 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNotNone(row["ci_low"])
         self.assertEqual(row["ci_method"], "stratified_subject_scenario_percentile")
         self.assertEqual(next(r for r in report["pair_coverage"] if r["source"] == "human")["complete_pairs"], 2)
+
+    def test_unpaired_single_subject_per_arm_has_no_population_interval(self):
+        models, humans = [], []
+        for i in range(12):
+            records = pair(f"s{i}", 10)
+            models.extend(records)
+            humans.extend([human(records, "event", "event_subject", 40),
+                           human(records, "neutral", "neutral_subject", 30)])
+        report = self.run_analysis(models, humans, bootstrap=200)
+        row = next(r for r in report["human_comparisons"] if r["metric"] == "gold_pct")
+        self.assertEqual((row["estimate"], row["n_subjects"], row["n_clusters"]), (0, 2, 12))
+        self.assertIsNone(row["ci_low"])
+        self.assertIsNone(row["ci_high"])
+        self.assertEqual(row["bootstrap_valid_draws"], 0)
+        self.assertEqual(row["ci_unavailable_reason"], "requires_two_subjects_per_arm_stratum")
+
+    def test_unpaired_total_subject_count_does_not_hide_a_singleton_arm(self):
+        models, humans = self.unpaired_fixture()
+        humans = [r for r in humans if r["result"]["subject_id"] != "b"]
+        report = self.run_analysis(models, humans)
+        row = next(r for r in report["human_comparisons"] if r["metric"] == "gold_pct")
+        self.assertEqual(row["n_subjects"], 3)
+        self.assertIsNone(row["ci_low"])
+        self.assertEqual(row["ci_unavailable_reason"], "requires_two_subjects_per_arm_stratum")
+
+    def test_counterbalanced_singleton_stratum_has_no_population_interval(self):
+        s1, s2 = pair("s1"), pair("s2")
+        humans = [human(s1, "event", "a", 40), human(s2, "neutral", "a", 30),
+                  human(s1, "event", "b", 45), human(s2, "neutral", "b", 35),
+                  human(s1, "neutral", "c", 20), human(s2, "event", "c", 50)]
+        report = self.run_analysis(s1 + s2, humans)
+        row = next(r for r in report["human_comparisons"] if r["metric"] == "gold_pct")
+        self.assertEqual(row["n_subjects"], 3)
+        self.assertIsNotNone(row["ci_low"])  # all three subjects share the same counterbalanced stratum
+        humans.append(human(s1, "neutral", "d", 25))  # a singleton neutral-only stratum
+        report = self.run_analysis(s1 + s2, humans)
+        row = next(r for r in report["human_comparisons"] if r["metric"] == "gold_pct")
+        self.assertIsNone(row["ci_low"])
+        self.assertEqual(row["ci_unavailable_reason"], "requires_two_subjects_per_arm_stratum")
 
     def test_unpaired_requires_valid_response_on_each_side(self):
         models, humans = self.unpaired_fixture()

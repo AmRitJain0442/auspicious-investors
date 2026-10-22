@@ -1,13 +1,15 @@
 {
   "_note": "illustrative, not a preregistration",
   "schema_version": 1,
+  "return_tolerance_pp": 0.01,
   "primary": [
     {
       "id": "h1_cue_sensitivity_en",
       "table": "effects",
       "metric": "gold_pct",
       "contrast": "event_minus_neutral",
-      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "expected_tests": 8,
       "minimum_meaningful_effect": 2.0
     },
     {
@@ -15,15 +17,17 @@
       "table": "effects",
       "metric": "gold_pct",
       "contrast": "event_minus_occasion_control",
-      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "expected_tests": 8,
       "minimum_meaningful_effect": 2.0
     },
     {
       "id": "h3_unsupported_return_claim_en",
       "table": "effects",
-      "metric": "return_claim_deviation_pp",
+      "metric": "return_claim_absolute_error_pp",
       "contrast": "event_minus_neutral",
-      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "en"},
+      "expected_tests": 8,
       "minimum_meaningful_effect": 0.5
     },
     {
@@ -31,7 +35,8 @@
       "table": "language_interactions",
       "metric": "gold_pct",
       "contrast": "event_minus_neutral",
-      "filters": {"cue": "festival_named", "persona_id": "unspecified", "language": "hi"},
+      "filters": {"source": "model", "cue": "festival_named", "persona_id": "unspecified", "language": "hi"},
+      "expected_tests": 8,
       "minimum_meaningful_effect": 2.0
     }
   ],
