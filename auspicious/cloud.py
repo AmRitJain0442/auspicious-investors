@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import contextlib
 import datetime as dt
 import hashlib
@@ -16,7 +17,8 @@ import time
 import uuid
 import zipfile
 
-from .core import atomic_text, canonical, read_jsonl, run_trials, strict_json
+from .core import _select_trials, atomic_text, canonical, read_jsonl, run_trials, strict_json, write_jsonl
+from .budget import BudgetExhausted, BudgetLedger
 from .gemini import GeminiProvider
 from .stimuli import build_trials
 
@@ -79,6 +81,53 @@ def upload_tree(bucket, prefix, directory):
             bucket.blob(prefix + "/" + path.relative_to(directory).as_posix()).upload_from_filename(str(path))
 
 
+def _guarded_collection(trials, trials_path, output, provider, spec, bucket, prefix, root, protocol_path, spec_hash):
+    """Each bounded chunk reserves all request attempts before any of its calls."""
+    size = spec.get("budget_chunk_trials", 400)
+    pair_size = len({t["condition"] for t in trials})
+    if type(size) is not int or size < pair_size or size % pair_size:
+        raise ValueError("budget_chunk_trials must be a positive whole-pair multiple")
+    ledger = BudgetLedger(bucket.blob(prefix + "/budget-ledger.json"), root / "budget-ledger.json",
+                          spec_hash, spec["model_budget_usd"])
+    checkpoint = Checkpoint(bucket, prefix)
+    ordered = _select_trials(trials, None)
+    completed = set()
+    if (output / "journal.sqlite").exists():
+        with sqlite3.connect(output / "journal.sqlite") as connection:
+            completed = {row[0] for row in connection.execute("SELECT trial_id FROM results")}
+    executed, summary = 0, None
+    try:
+        for end in range(size, len(ordered) + size, size):
+            end = min(end, len(ordered))
+            pending = [t for t in _select_trials(trials, end) if t["trial_id"] not in completed]
+            if not pending:
+                continue
+            bound = estimate_cost(pending, spec)["model_cost_upper_bound_usd"]
+            ledger.reserve(pending, bound)
+            summary = run_trials(trials_path, output, provider, concurrency=spec["concurrency"],
+                                 limit=end, prereg_path=protocol_path, checkpoint=checkpoint)
+            records = read_jsonl(output / "records.jsonl")
+            pending_ids = {t["trial_id"] for t in pending}
+            batch = [r for r in records if r["trial"]["trial_id"] in pending_ids]
+            ledger.settle(batch, spec, estimate_cost)
+            executed += summary["executed"]
+            completed.update(r["trial"]["trial_id"] for r in batch)
+    except BudgetExhausted:
+        records = read_jsonl(output / "records.jsonl") if (output / "records.jsonl").exists() else []
+        write_jsonl(output / "records.jsonl", records)
+        summary = {"executed": executed, "stored": len(records), "selected": len(trials),
+                   "total_trials": len(trials), "counts": dict(Counter(r["result"]["status"] for r in records)),
+                   "complete": False, "output": str(output), "budget_exhausted": True}
+        atomic_text(output / "summary.json", json.dumps(summary, indent=2) + "\n")
+        return summary, dict(ledger.state)
+    if summary is None:
+        summary = run_trials(trials_path, output, provider, concurrency=spec["concurrency"],
+                             prereg_path=protocol_path, checkpoint=checkpoint)
+    summary["executed"] = executed
+    atomic_text(output / "summary.json", json.dumps(summary, indent=2) + "\n")
+    return summary, dict(ledger.state)
+
+
 def run_cloud(bucket_name, run_id, directory="/work"):
     from google.cloud import storage
     from google.api_core.exceptions import PreconditionFailed
@@ -89,6 +138,10 @@ def run_cloud(bucket_name, run_id, directory="/work"):
     prefix = "runs/" + run_id
     raw = bucket.blob(prefix + "/run.json").download_as_bytes()
     spec = strict_json(raw.decode("utf-8"))
+    if spec.get("budget_mode", "static") not in ("static", "guarded_chunks"):
+        raise ValueError("budget_mode must be static or guarded_chunks")
+    if os.environ.get("AUSPICIOUS_SOURCE_REVISION") and spec.get("source_revision") != os.environ["AUSPICIOUS_SOURCE_REVISION"]:
+        raise ValueError("Run specification source revision does not match this container")
     spec_hash = hashlib.sha256(raw).hexdigest()
     status_blob = bucket.blob(prefix + "/status.json")
     if status_blob.exists():
@@ -120,10 +173,14 @@ def run_cloud(bucket_name, run_id, directory="/work"):
         shutil.copyfile(design, inputs / "design.json")
         shutil.copyfile("data/stimuli.json", inputs / "stimuli.json")
         atomic_text(inputs / "run.json", raw.decode("utf-8"))
+        protocol_path = None
+        if spec.get("collection_plan") is not None:
+            protocol_path = inputs / "collection-plan.json"
+            atomic_text(protocol_path, canonical(spec["collection_plan"]) + "\n")
         built = build_trials(design, inputs / "trials.jsonl")
         trials = read_jsonl(inputs / "trials.jsonl")
         estimate = estimate_cost(trials, spec)
-        if estimate["model_cost_upper_bound_usd"] > spec["model_budget_usd"]:
+        if spec.get("budget_mode", "static") == "static" and estimate["model_cost_upper_bound_usd"] > spec["model_budget_usd"]:
             raise ValueError("Conservative request-cost bound exceeds this run's model budget")
         atomic_text(root / "cost-plan.json", json.dumps(estimate, indent=2) + "\n")
         atomic_text(root / "design-summary.json", json.dumps(built, indent=2) + "\n")
@@ -133,18 +190,29 @@ def run_cloud(bucket_name, run_id, directory="/work"):
         if checkpoint_blob.exists():
             checkpoint_blob.download_to_filename(str(output / "journal.sqlite"))
         provider = GeminiProvider(spec["model"], project=spec["project"], **spec["generation"])
-        summary = run_trials(inputs / "trials.jsonl", output, provider,
-                             concurrency=spec["concurrency"],
-                             checkpoint=Checkpoint(bucket, prefix))
+        ledger_state = None
+        if spec.get("budget_mode") == "guarded_chunks":
+            summary, ledger_state = _guarded_collection(trials, inputs / "trials.jsonl", output, provider, spec,
+                                                       bucket, prefix, root, protocol_path, spec_hash)
+        else:
+            summary = run_trials(inputs / "trials.jsonl", output, provider, concurrency=spec["concurrency"],
+                                 prereg_path=protocol_path, checkpoint=Checkpoint(bucket, prefix))
         from .analysis import analyze
-        analyze(output / "records.jsonl", root / "analysis", bootstrap=spec.get("bootstrap", 2000))
+        analyze(output / "records.jsonl", root / "analysis", bootstrap=0, trials_path=inputs / "trials.jsonl",
+                inference_method="descriptive")
+        if spec.get("exploratory_split_tables"):
+            analyze(output / "records.jsonl", root / "analysis-all-splits-exploratory", bootstrap=0,
+                    trials_path=inputs / "trials.jsonl", evaluation_splits=("train", "dev", "test"),
+                    inference_method="descriptive")
         records = read_jsonl(output / "records.jsonl")
         usage = {"promptTokenCount": 0, "candidatesTokenCount": 0, "thoughtsTokenCount": 0,
                  "totalTokenCount": 0, "cachedContentTokenCount": 0}
         for record in records:
             for key in usage:
                 usage[key] += record["result"].get("usage", {}).get(key, 0)
-        state.update(state="completed_with_errors" if summary["counts"].get("error") else "completed",
+        terminal = ("budget_exhausted" if summary.get("budget_exhausted") else
+                    "completed_with_errors" if summary["counts"].get("error") else "completed")
+        state.update(state=terminal, budget_ledger=ledger_state,
                      summary=summary, usage=usage, cost_plan=estimate,
                      finished_at=dt.datetime.now(dt.timezone.utc).isoformat())
         hashes = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()

@@ -96,3 +96,47 @@ the private cloud copy remains available until the PC is back online.
 For this initial deployment, a local scheduled download can run periodically and at the next
 sign-in. Its task name is passed to the script so it removes only that task after a successful
 download. The cloud experiment itself is independent of the download task.
+
+
+## Full Gemini study (after the preliminary pilot)
+
+`examples/vertex-full-study.json` crosses both cue types, three personas, two templates,
+five languages, four occasions, two roles and twelve authored scenarios: **28,800 trials**
+in 5,760 five-condition task groups. This is the complete shipped Gemini behavioral design,
+not a human study or an open-weight intervention experiment. The original pilot remains a
+separate dataset. The frozen descriptive plan is `cloud/full-study-plan.json` and is copied
+and hash-bound before the first request. It is not externally preregistered.
+
+Use the integrated audited collector/analysis. Test-split output contains 9,600 planned
+responses with four authored scenario clusters; all-split exploratory tables retain split
+strata. No population CIs, significance or equivalence claims are generated. Materials
+retain the independent-review and construct-validity limitations in the audit response.
+
+The full specification uses `budget_mode: "guarded_chunks"` and whole-pair chunks of 400
+trials. Before a chunk sends any requests, its maximum input/output and all allowed HTTP
+attempts are durably reserved in a generation-protected GCS budget ledger. Savings are
+released only from verified response token metadata. Unknown transport/parse outcomes
+retain their conservative charge; a crash's outstanding chunk reservation is charged in
+full on resume. A stopped collection publishes `budget_exhausted`, partial data and analysis
+and is never labeled complete. This ledger guards token charges at declared prices; it
+is not a Cloud Billing account cap, and infrastructure/taxes are separate.
+
+The initial US$100 pilot ceiling was subsequently relaxed by the user for the full study.
+At the global Standard PayGo prices verified on 24 October 2026, the full-design conservative
+model bound is about US$692.70 (maximum output and both attempts for every trial), while
+extrapolating recorded pilot token usage gives about US$42.48. The concrete full-run allowance
+is US$750, so the original pilot ceiling does not stop the fixed full design. The allowance
+is not a forecast of actual spending. See the uploaded run and budget ledger for actual
+accounted usage. [Official model pricing](https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing)
+includes output thinking tokens; documented non-200 HTTP responses are not charged.
+
+Deploy one Cloud Run task, parallelism one, max retries zero, 2 CPUs, 4 GiB and a 12-hour
+timeout. Pin the image digest and supply its source revision at Docker build time with
+`cloud/build.yaml`. Run `examples/vertex-full-smoke.json` (50 trials covering both cues and
+all languages) first; verify collection, budget accounting, original-roster analysis and
+checksums before executing the full study. Completed runs remain idempotent.
+
+Cloud checkpoints continue without the PC. The downloader supports both completed and
+budget-stopped runs, preserves the exact inputs and raw responses, and verifies their
+SHA-256 checksums. A local scheduled task can download at five-minute intervals and the
+next sign-in, then remove itself after successful terminal download.

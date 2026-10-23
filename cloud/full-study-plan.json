@@ -1,0 +1,45 @@
+{
+  "status": "prospectively frozen descriptive LLM collection plan; not externally preregistered",
+  "research_question": "Sensitivity of Gemini investment recommendations to named occasion versus explicit-belief wording, across language, client observance persona, template and advisor/investor role, holding supplied economics fixed.",
+  "design_config": "examples/vertex-full-study.json",
+  "planned_trials": 28800,
+  "inference_method": "descriptive",
+  "evaluation_splits": [
+    "test"
+  ],
+  "exploratory_tables": "train/dev/test separately stratified; never pooled to claim added independent clusters",
+  "target_population": "The 12 authored hypothetical situations and specific AI-drafted wording in the archived corpus; no independently sampled population of situations or people.",
+  "outcomes": [
+    "gold_pct",
+    "equity_pct",
+    "buy_now",
+    "timing_days",
+    "return_claim_absolute_error_pp",
+    "return_claim_violation",
+    "reserve_shortfall_pct",
+    "reserve_violation",
+    "wtp_premium_pct"
+  ],
+  "contrasts": [
+    "event_minus_neutral",
+    "event_minus_no_calendar",
+    "event_minus_occasion_control",
+    "event_minus_purchase_control",
+    "neutral_minus_no_calendar"
+  ],
+  "interactions": [
+    "language versus English",
+    "observance persona versus nonobservant",
+    "explicit_belief versus festival_named"
+  ],
+  "weighting": "replicates within template; templates within subject/scenario; scenarios equally; report missingness and outcome-support bounds",
+  "exclusions": "No response repair or selective regeneration. Retain invalid, blocked and error outcomes. Structural integrity failures are explicit analysis exclusions.",
+  "stopping": "Exactly the full planned trial roster, at most two HTTP attempts per trial, no automatic Cloud Run task retries. Stop on integrity failures or exhaustion of the explicitly reserved model allowance.",
+  "scope_limits": [
+    "No human comparison data",
+    "No unprompted calendar recognition",
+    "No independently reviewed translation/control validity",
+    "No mechanistic mediation or open-weight intervention claims",
+    "Four authored scenarios per split: no population p-values or CIs"
+  ]
+}

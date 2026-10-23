@@ -6,6 +6,7 @@ import csv
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -21,7 +22,8 @@ def runtime_identity():
     root = Path(__file__).resolve().parent
     files = {p.name: sha256(p) for p in sorted(root.glob("*.py"))}
     versions = {}
-    for name in ("auspicious-investors", "numpy", "torch", "transformers", "tokenizers", "google-auth"):
+    for name in ("auspicious-investors", "numpy", "torch", "transformers", "tokenizers", "google-auth",
+                 "google-cloud-storage", "requests"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -30,7 +32,7 @@ def runtime_identity():
         revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
                                   text=True, check=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        revision = None
+        revision = os.environ.get("AUSPICIOUS_SOURCE_REVISION")
     return {"source_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest(),
             "source_files": files, "git_revision": revision, "python": platform.python_version(),
             "platform": platform.platform(), "dependencies": versions}

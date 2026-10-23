@@ -36,6 +36,9 @@ class Blob:
     def exists(self):
         return self.data is not None
 
+    def reload(self):
+        return None
+
     def download_as_bytes(self):
         return self.data.encode() if isinstance(self.data, str) else self.data
 

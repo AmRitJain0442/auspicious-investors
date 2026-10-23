@@ -13,7 +13,7 @@ $prefix = 'gs://' + $Bucket + '/runs/' + $RunId
 $statusText = gcloud storage cat ($prefix + '/status.json') --project=$Project 2>$null
 if ($LASTEXITCODE -ne 0) { Write-Output 'The cloud run has not published a status yet.'; exit 0 }
 $status = ($statusText -join "`n") | ConvertFrom-Json
-if ($status.state -notin @('completed', 'completed_with_errors', 'failed')) {
+if ($status.state -notin @('completed', 'completed_with_errors', 'budget_exhausted', 'failed')) {
     Write-Output ('Cloud experiment is still ' + $status.state + '.'); exit 0
 }
 New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
